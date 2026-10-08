@@ -1,0 +1,96 @@
+{
+  "projectType": "ai-ml",
+  "projectName": "Trading Agent Bot",
+  "projectDescription": "An asynchronous multi-agent cryptocurrency trading bot that connects to Binance via CCXT, uses EMA crossover strategies, manages risk automatically, and is controlled entirely through a Telegram chat interface.",
+  "theme": "luma",
+  "primaryColor": "#10B981",
+  "lightColor": "#D1FAE5",
+  "darkColor": "#065F46",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "configuration"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/multi-agent-system",
+              "architecture/trading-cycle"
+            ]
+          },
+          {
+            "group": "Trading Strategies",
+            "pages": [
+              "strategies/ema-crossover",
+              "strategies/trading-modes",
+              "strategies/risk-management"
+            ]
+          },
+          {
+            "group": "Telegram Interface",
+            "pages": [
+              "telegram/commands",
+              "telegram/agent-control",
+              "telegram/cashflow-wallet"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/deployment",
+              "operations/backtesting",
+              "operations/logging-database"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Multi-agent architecture with four specialized trading sub-agents (Scalper T1, Momentum T2, MacroTrader, Speculative T3)",
+    "EMA Crossover strategy with configurable fast/slow periods and anti-repainting protection",
+    "Three trading modes: Trend (aggressive stop-loss), Target (hold to take-profit), and Scalper (micro-gains)",
+    "Dynamic timeframe switching between active (1m) and passive (5m) market hours",
+    "Full Telegram bot UI with inline keyboards, per-agent controls, and manual order execution",
+    "Comprehensive risk management: max positions, capital exposure, daily loss limit, trailing stop, micro-DCA, and time-based stop",
+    "Paper trading mode with isolated digital wallet and precise P&L accounting",
+    "Automatic profit harvesting and CLP (Chilean Peso) currency conversion",
+    "SQLite database for candle history collection, trade records, and decision logs",
+    "Asynchronous engine built on asyncio, CCXT, APScheduler, and python-telegram-bot"
+  ],
+  "publicApiSurface": [
+    "OrchestratorBot.start_all() / stop_all()",
+    "OrchestratorBot.pause_agent(agent_id) / resume_agent(agent_id)",
+    "OrchestratorBot.execute_manual_order(symbol, side, amount)",
+    "OrchestratorBot.get_global_status()",
+    "BaseAgent.run_cycle()",
+    "BaseAgent.get_status()",
+    "BaseAgent.set_capital(amount)",
+    "RiskManager.can_open_position(current_open_positions)",
+    "RiskManager.check_capital_exposure(current_exposure, total_capital)",
+    "RiskManager.check_daily_loss(daily_loss, total_capital)",
+    "RiskManager.calculate_position_size(total_capital, entry_price, stop_loss_price)",
+    "EMACrossoverStrategy.generate_signal(df)",
+    "PortfolioManager.get_cashflow_summary()",
+    "PortfolioManager.get_portfolio_summary()",
+    "PortfolioManager.add_cashflow_record(type, amount, description)",
+    "PortfolioManager.reset_pnl(is_paper)",
+    "PortfolioManager.monetize_asset_async(base_asset, price, is_paper)",
+    "TelegramListener.start_polling()",
+    "/status, /wallet, /matriz, /cashflow, /stats, /why_block, /horarios",
+    "/mode [trend|target|scalper]",
+    "/pause, /resume, /pause_<agent>, /resume_<agent>",
+    "/buy <symbol> <amount>, /sell <symbol> <amount>",
+    "/deposit <amount> [note], /expense <amount> [note]",
+    "/monetizar <asset>, /reset_pnl"
+  ]
+}

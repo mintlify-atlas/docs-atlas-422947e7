@@ -1,0 +1,344 @@
+---
+title: "Deploy and Run Trading Agent Bot in Production"
+sidebarTitle: "Deployment"
+description: "Step-by-step guide to deploying Trading Agent Bot as a persistent background service with tmux, environment setup, and production-readiness hardening."
+---
+
+Trading Agent Bot is designed to run continuously as a 24/7 background service. This page covers every deployment method — from a simple direct invocation for development, to a robust tmux service that survives terminal disconnections and machine reboots — along with the environment configuration, capital reset scripts, and security requirements you need before going live.
+
+## Running Modes
+
+<CardGroup cols={2}>
+  <Card title="Direct (foreground)" icon="terminal">
+    Activate the virtual environment and run `python main.py` directly. Logs print to stdout. Exits when the terminal closes.
+  </Card>
+  <Card title="tmux background service" icon="server">
+    Start via the service script. The bot runs in a detached tmux session called `bot` and survives SSH disconnections and terminal close.
+  </Card>
+  <Card title="GUI Launcher (Zenity)" icon="window">
+    The `Tredding_Agent_Bot` global command opens a Zenity radio-list menu to choose foreground or background mode without typing any shell commands.
+  </Card>
+  <Card title="Headless service (CI / VPS)" icon="cloud">
+    Use `start_bot_service.sh` on a VPS. It waits for internet connectivity before launching, making it safe for use in auto-start (`@reboot` cron) scenarios.
+  </Card>
+</CardGroup>
+
+### Direct Invocation
+
+The simplest way to run the bot — useful during development and initial configuration.
+
+```bash
+# Activate virtualenv
+source .venv/bin/activate
+
+# Run
+python main.py
+```
+
+### GUI Launcher — `start_bot.sh`
+
+The `Tredding_Agent_Bot` global CLI command (registered during setup) calls `start_bot.sh`. A Zenity dialog presents two options:
+
+- **Option 0 — SIN TERMINAL (background):** Creates a detached `tmux` session named `tradingbot`. The terminal can be closed safely.
+- **Option 1 — CON TERMINAL (foreground):** Opens the bot inside your default terminal emulator (alacritty → kitty → foot → x-terminal-emulator fallback).
+
+```bash
+#!/bin/bash
+# start_bot.sh — Zenity GUI launcher
+cd "$(dirname "$0")"
+
+CHOICE=$(zenity --list --radiolist \
+    --title="TradingBot Launcher" \
+    --text="Selecciona el modo de ejecución del bot:" \
+    --column="Selección" --column="ID" --column="Modo" \
+    FALSE "0" "SIN TERMINAL (Segundo plano silencioso)" \
+    TRUE  "1" "CON TERMINAL (Ventana visible)" \
+    --print-column=2 --hide-column=2 --width=400 --height=200)
+
+if [ "$CHOICE" = "1" ]; then
+    if command -v alacritty &> /dev/null; then
+        alacritty -e bash -c "source .venv/bin/activate && python main.py; exec bash" &
+    elif command -v kitty &> /dev/null; then
+        kitty bash -c "source .venv/bin/activate && python main.py; exec bash" &
+    else
+        x-terminal-emulator -e bash -c "source .venv/bin/activate && python main.py; exec bash" &
+    fi
+elif [ "$CHOICE" = "0" ]; then
+    if tmux has-session -t tradingbot 2>/dev/null; then
+        zenity --info --title="TradingBot" \
+               --text="El bot ya está corriendo en segundo plano." --width=300
+    else
+        tmux new-session -d -s tradingbot \
+             "source .venv/bin/activate && python main.py"
+        zenity --info --title="TradingBot" \
+               --text="✅ El bot se ha iniciado en segundo plano (tmux: tradingbot)." --width=350
+    fi
+fi
+```
+
+### Headless Service — `start_bot_service.sh` / `stop_bot_service.sh`
+
+For VPS and server deployments without a display, use the service scripts directly. The start script waits up to 60 seconds for network connectivity before launching — critical when starting on boot after a power cut.
+
+```bash
+#!/usr/bin/env bash
+# start_bot_service.sh
+SESSION_NAME="bot"
+BOT_DIR="/home/shifu/tredding-agent"
+VENV_PYTHON="${BOT_DIR}/.venv/bin/python"
+
+cd "${BOT_DIR}" || exit 1
+
+if tmux has-session -t "${SESSION_NAME}" 2>/dev/null; then
+    echo "⚠️ La sesión tmux '${SESSION_NAME}' ya se encuentra activa."
+    exit 0
+fi
+
+echo "⏳ Verificando conectividad a internet..."
+for i in {1..30}; do
+    if ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1 || \
+       curl -s --head https://api.binance.com >/dev/null 2>&1 || \
+       curl -s --head https://api.telegram.org >/dev/null 2>&1; then
+        echo "🌐 Conexión a internet confirmada."
+        break
+    fi
+    sleep 2
+done
+
+echo "🚀 Iniciando Trading Bot en sesión tmux '${SESSION_NAME}'..."
+tmux new-session -d -s "${SESSION_NAME}" \
+    "bash -c 'cd ${BOT_DIR} && ${VENV_PYTHON} main.py; echo \"[TradingBot finalizado con código \$?]\"; exec bash'"
+
+sleep 2
+if tmux has-session -t "${SESSION_NAME}" 2>/dev/null; then
+    echo "✅ Trading Bot iniciado exitosamente en tmux '${SESSION_NAME}'."
+    exit 0
+else
+    echo "❌ Error al iniciar la sesión tmux '${SESSION_NAME}'."
+    exit 1
+fi
+```
+
+To stop the service gracefully:
+
+```bash
+#!/usr/bin/env bash
+# stop_bot_service.sh
+SESSION_NAME="bot"
+if tmux has-session -t "${SESSION_NAME}" 2>/dev/null; then
+    echo "🛑 Deteniendo sesión tmux '${SESSION_NAME}'..."
+    tmux kill-session -t "${SESSION_NAME}"
+    echo "✅ Sesión tmux '${SESSION_NAME}' detenida."
+else
+    echo "ℹ️ La sesión tmux '${SESSION_NAME}' no estaba en ejecución."
+fi
+```
+
+To re-attach to a running background session and inspect live logs:
+
+```bash
+tmux attach -t bot
+# Detach again without stopping: Ctrl+B, then D
+```
+
+---
+
+## Environment Setup
+
+<Tabs>
+  <Tab title="Linux (recommended)">
+    All launch scripts are Bash and depend on `tmux`. Linux (Ubuntu, Arch, or similar) is the recommended platform.
+
+    ```bash
+    # Install system dependencies
+    sudo apt install python3.10 python3-pip tmux git -y
+
+    # Clone the repository
+    git clone https://github.com/Shifuwu123/Trading-Agent-Bot.git
+    cd Trading-Agent-Bot
+
+    # Create and activate virtual environment
+    python3.10 -m venv .venv
+    source .venv/bin/activate
+
+    # Install Python dependencies
+    pip install -r requirements.txt
+    ```
+  </Tab>
+  <Tab title="Environment File (.env)">
+    Copy `.env.example` to `.env` and fill in your credentials:
+
+    ```bash
+    cp .env.example .env
+    ```
+
+    ```ini
+    # .env — fill in real values, never commit this file
+
+    # Exchange (CCXT / Binance)
+    EXCHANGE_ID=binance
+    EXCHANGE_API_KEY=tu_exchange_api_key_aqui
+    EXCHANGE_API_SECRET=tu_exchange_api_secret_aqui
+    EXCHANGE_TESTNET=true           # ← set false for production
+
+    # Telegram
+    TELEGRAM_BOT_TOKEN=tu_telegram_bot_token_aqui
+    TELEGRAM_CHAT_ID=tu_telegram_chat_id_aqui
+
+    # Email (optional)
+    SMTP_HOST=smtp.gmail.com
+    SMTP_PORT=587
+    SMTP_USER=tu_correo@gmail.com
+    SMTP_PASSWORD=tu_contraseña_de_aplicacion
+    EMAIL_RECIPIENT=tu_correo_destino@gmail.com
+
+    # Database
+    DATABASE_URL=sqlite:///tradingbot.db
+
+    # General
+    ENVIRONMENT=development
+    LOG_LEVEL=INFO
+    PAPER_TRADING=true              # ← set false for live trades
+    ```
+  </Tab>
+  <Tab title="Python Version">
+    The project requires **Python 3.10 or later** (enforced in `pyproject.toml`):
+
+    ```toml
+    [project]
+    name = "tradingbot"
+    version = "0.2.0"
+    requires-python = ">=3.10"
+    ```
+
+    Verify your interpreter version before installing:
+
+    ```bash
+    python3 --version   # must be 3.10+
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Going Live Checklist
+
+<Warning>
+  **Production trading carries real financial risk.** Always validate your full configuration on Binance Testnet with `PAPER_TRADING=true` before enabling live trades. Misconfigured risk limits or incorrect API permissions can result in unintended orders and capital loss.
+</Warning>
+
+<Steps>
+  <Step title="Verify on Testnet with Paper Trading">
+    Keep `EXCHANGE_TESTNET=true` and `PAPER_TRADING=true` in your `.env`. Run the bot for at least 24–48 hours, confirm Telegram commands respond correctly, and review the daily loss limit behaviour via `/status` and `/report`.
+  </Step>
+  <Step title="Switch to Live Exchange and Real Trading">
+    Update your `.env` to point at the live Binance API:
+
+    ```ini
+    EXCHANGE_TESTNET=false
+    PAPER_TRADING=false
+    ```
+
+    Replace the testnet API key/secret with your **live Binance credentials** (read + trade permissions only — no withdrawal rights).
+  </Step>
+  <Step title="Lock Down Telegram Access">
+    Ensure `TELEGRAM_CHAT_ID` is set to your numeric user ID. The bot's `TelegramListener` enforces this whitelist and silently ignores all commands from any other chat ID.
+
+    ```ini
+    TELEGRAM_CHAT_ID=123456789   # obtain via @userinfobot in Telegram
+    ```
+  </Step>
+  <Step title="Review Risk Parameters in config.yaml">
+    Open `config.yaml` and adjust the `risk` block before going live:
+
+    ```yaml
+    risk:
+      max_open_positions: 10
+      max_capital_exposure_pct: 1.00
+      coin_reserve_pct: 0.25
+      max_coin_order_pct: 0.75
+      min_order_usd: 0.10
+      max_loss_per_trade_pct: 0.02
+      daily_loss_limit_pct: 0.05     # 5% daily stop — tune this first
+      max_drawdown_pct: 0.20
+      default_take_profit_pct: 0.04
+      trailing_stop: true
+      trailing_stop_positive: 0.02
+    ```
+
+    Pay special attention to `daily_loss_limit_pct` and `max_open_positions` — these are your primary safety nets.
+  </Step>
+  <Step title="Launch the Background Service">
+    Run the service script from the project root:
+
+    ```bash
+    bash start_bot_service.sh
+    ```
+
+    The script confirms internet connectivity, starts the bot inside tmux session `bot`, and exits with code `0` on success. Use `tmux attach -t bot` to verify the first few log lines, then detach.
+  </Step>
+</Steps>
+
+---
+
+## Capital Reset Scripts
+
+The `scripts/` directory contains maintenance scripts for resetting the paper-trading wallet to a known capital baseline. Both scripts **preserve the `candles` and `decision_logs` tables** — which are the ML training datasets — and create a timestamped `.bak` backup before making any changes.
+
+<Accordion title="reset_to_16usd_matrix.py — 16 Coins × $1 USD">
+  Resets the digital wallet to **$16.00 USD**, distributed as $1.00 per coin across the 16-coin multi-agent matrix:
+
+  | Agent | Capital | Coins |
+  |---|---|---|
+  | ScalperAgent_Tier1 | $7.00 | SOL, BNB, XRP, SUI, NEAR, DOGE, ADA |
+  | MomentumAgent_Tier2 | $5.00 | FET, TAO, WLD, STRK, QNT |
+  | SpeculativeAgent_Tier3 | $2.00 | BEAMX, MUBARAK |
+  | MacroTrader_BTCETH | $2.00 | BTC, ETH |
+
+  Use this script when starting a new multi-agent simulation run from the minimum capital baseline.
+
+  ```bash
+  python scripts/reset_to_16usd_matrix.py
+  ```
+
+  The script performs a WAL checkpoint, creates a backup at `tradingbot.db.bak_matrix_16usd_<timestamp>`, archives all open trades, zeros all portfolio holdings, resets the wallet to `$16.00`, and verifies the `candles` table row count is unchanged.
+</Accordion>
+
+<Accordion title="reset_to_50usd.py — General $50 USD Reset">
+  Resets the digital wallet to **$50.00 USD** without the coin-matrix constraints. Suitable for general-purpose paper trading resets.
+
+  ```bash
+  python scripts/reset_to_50usd.py
+  ```
+
+  Like the matrix reset, it archives all open trades, zeroes portfolio holdings, clears cash flow, and preserves the candles and decision log datasets. A backup is written to `tradingbot.db.bak_pre_reset_50usd_<timestamp>`.
+</Accordion>
+
+<Accordion title="monetize_asset.py — Harvest Profits to USDT">
+  Liquidates a held position and credits the realised P&L to the digital wallet. Useful when a coin has appreciated significantly and you want to rotate capital back to liquid USDT.
+
+  ```bash
+  # Liquidate at current market price
+  python scripts/monetize_asset.py SOL
+
+  # Liquidate at a manual override price
+  python scripts/monetize_asset.py DOGE --price 0.095
+  ```
+
+  The script fetches the live price via CCXT, calls `PortfolioManager.monetize_asset_async()`, prints a summary of the realised P&L, and sends a Telegram notification.
+</Accordion>
+
+---
+
+## Security Hardening
+
+<Note>
+  The logger in `tradingbot/utils/logger.py` automatically redacts Telegram tokens, API keys, Bearer tokens, and GitHub tokens from all CSV log entries using regex sanitisation before any string is written to disk.
+</Note>
+
+Follow these rules before exposing the bot to a live exchange:
+
+- **Never commit `.env`** — confirm your `.gitignore` excludes it. The `.env.example` template is safe to commit; your actual `.env` is not.
+- **API key permissions** — create a Binance API key with **Enable Reading** and **Enable Spot & Margin Trading** only. Leave "Enable Withdrawals" unchecked. The bot never requires withdrawal rights.
+- **`TELEGRAM_CHAT_ID` whitelist** — every Telegram command handler checks the incoming `chat_id`. Set this to your personal numeric ID so no other Telegram user can control your bot.
+- **Rotate API keys regularly** — if you suspect a key has been exposed, revoke it on the Binance dashboard immediately and issue a new one before restarting the bot.

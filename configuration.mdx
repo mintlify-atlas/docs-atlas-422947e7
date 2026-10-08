@@ -1,0 +1,520 @@
+---
+title: "Configure Trading Agent Bot Settings and Environment"
+sidebarTitle: "Configuration"
+description: "Complete reference for every environment variable in .env and every key in config.yaml, including risk limits, strategies, scheduler, and logging options."
+---
+
+Trading Agent Bot is configured through two separate files that serve distinct purposes. The `.env` file holds secrets and environment-specific values — API keys, tokens, database connection strings — and is never committed to source control. The `config.yaml` file controls the bot's operational behaviour — which pairs to trade, which strategy to run, risk thresholds, scheduler timing, and logging — and is safe to version alongside your code. Both files are fully commented in the repository; this page consolidates every option into a single reference.
+
+## Environment Variables (`.env`)
+
+Copy `.env.example` to `.env` at the project root and populate each variable with your real values before launching. The file is parsed by `pydantic-settings` via the `EnvSettings` class in `tradingbot/core/config.py`, which validates types and applies defaults where shown.
+
+### Exchange
+
+<ParamField path="EXCHANGE_ID" type="string" default="binance">
+  The CCXT exchange identifier to connect to. Must be a valid CCXT exchange ID. Currently tested and supported with `binance`.
+</ParamField>
+
+<ParamField path="EXCHANGE_API_KEY" type="string" required>
+  Your exchange API key. For safe initial setup, generate this from [Binance Testnet](https://testnet.binance.vision/) and keep `EXCHANGE_TESTNET=true`. Keep this value secret — never log or share it.
+</ParamField>
+
+<ParamField path="EXCHANGE_API_SECRET" type="string" required>
+  Your exchange API secret, paired with `EXCHANGE_API_KEY`. Same security rules apply.
+</ParamField>
+
+<ParamField path="EXCHANGE_TESTNET" type="boolean" default="true">
+  When `true`, the CCXT connector routes all requests to the exchange's sandbox/testnet endpoint. Set to `false` only when you are ready to trade with real funds on mainnet.
+</ParamField>
+
+### Telegram
+
+<ParamField path="TELEGRAM_BOT_TOKEN" type="string" required>
+  The HTTP API token issued by [@BotFather](https://t.me/BotFather) when you create your bot. This is the credential used by `python-telegram-bot` to send and receive messages.
+</ParamField>
+
+<ParamField path="TELEGRAM_CHAT_ID" type="string" required>
+  The numeric Telegram Chat ID of the sole authorised user. All incoming commands from any other Chat ID are rejected silently. Obtain your ID by messaging [@userinfobot](https://t.me/userinfobot).
+</ParamField>
+
+### Email Notifications (Optional)
+
+<ParamField path="SMTP_HOST" type="string" default="smtp.gmail.com">
+  SMTP server hostname used for email delivery of weekly reports and alerts. Gmail's SMTP server is preconfigured in the example.
+</ParamField>
+
+<ParamField path="SMTP_PORT" type="integer" default="587">
+  SMTP port. Port `587` uses STARTTLS encryption, which is required by most modern mail providers.
+</ParamField>
+
+<ParamField path="SMTP_USER" type="string">
+  The email address used to authenticate with the SMTP server (i.e. the sender address).
+</ParamField>
+
+<ParamField path="SMTP_PASSWORD" type="string">
+  The SMTP authentication password. For Gmail accounts with 2FA enabled, generate an **App Password** from your Google Account security settings rather than using your regular login password.
+</ParamField>
+
+<ParamField path="EMAIL_RECIPIENT" type="string">
+  The destination email address for weekly portfolio reports and critical alerts.
+</ParamField>
+
+### Database
+
+<ParamField path="DATABASE_URL" type="string" default="sqlite:///tradingbot.db">
+  SQLAlchemy-compatible database connection string. The default creates a local SQLite file (`tradingbot.db`) at the project root. For production deployments, a PostgreSQL URL (`postgresql+asyncpg://user:pass@host/db`) is recommended for concurrent write performance.
+</ParamField>
+
+### General
+
+<ParamField path="ENVIRONMENT" type="string" default="development">
+  Runtime environment label. Accepted values: `development`, `production`. Affects log verbosity and may influence certain safety checks.
+</ParamField>
+
+<ParamField path="LOG_LEVEL" type="string" default="INFO">
+  Minimum log severity to emit. Accepted values: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. Use `DEBUG` when troubleshooting strategy signals or connectivity issues.
+</ParamField>
+
+<ParamField path="PAPER_TRADING" type="boolean" default="true">
+  When `true`, all trade execution is routed through the virtual paper wallet. No real orders are sent to the exchange. This is the recommended default for all new deployments.
+</ParamField>
+
+<Warning>
+  Never commit your `.env` file to any repository — public or private. Ensure it is listed in `.gitignore`. The `.env.example` template is safe to commit; `.env` is not.
+</Warning>
+
+---
+
+## `config.yaml`
+
+The YAML configuration file is loaded at startup by `load_yaml_config()` in `tradingbot/core/config.py` and validated against the `AppConfig` Pydantic model. The file is organised into five top-level sections: `bot`, `risk`, `strategies`, `scheduler`, and `logging`.
+
+<Tip>
+  Each of the four sub-agents (Scalper, Momentum, Macro, Speculative) can override any of these settings through their own YAML files in the `configs/` directory: `configs/agent_scalper.yaml`, `configs/agent_momentum.yaml`, `configs/agent_macro.yaml`, and `configs/agent_speculative.yaml`. Agent-level configs are merged on top of the global `config.yaml` at agent initialisation time, allowing per-agent capital pools, timeframes, and risk parameters without duplicating the entire config.
+</Tip>
+
+### `bot` — Core Bot Settings
+
+<ParamField path="bot.name" type="string" default="TradingBot">
+  Internal name used in log messages and Telegram reports for identifying this bot instance.
+</ParamField>
+
+<ParamField path="bot.mode" type="string" default="passive">
+  General operating mode.
+
+  - `passive` — Collect market data and store candles to the database; no trade execution.
+  - `active` — Full trade execution mode (paper or live, depending on `PAPER_TRADING`).
+  - `both` — Simultaneously collect data and execute trades.
+</ParamField>
+
+<ParamField path="bot.trading_mode" type="string" default="scalper">
+  Controls position-exit logic and agent personality.
+
+  - `trend` — Cut losses aggressively when the market reverses. Ideal for directional bull markets.
+  - `target` — Hold positions until the take-profit target is reached regardless of interim drawdown. Guarantees profitable closes but may lock capital during corrections.
+  - `scalper` — Short-duration, rapid-cycle mode with tight entry and exit parameters.
+</ParamField>
+
+<ParamField path="bot.trading_pairs" type="string[]">
+  List of CCXT-format trading pair symbols to monitor and trade. Must use the `BASE/QUOTE` format (e.g. `BTC/USDT`). The default list is:
+
+  ```yaml
+  trading_pairs:
+    - "BTC/USDT"
+    - "ETH/USDT"
+    - "SOL/USDT"
+    - "AVAX/USDT"
+    - "XRP/USDT"
+    - "DOGE/USDT"
+    - "ADA/USDT"
+    - "LINK/USDT"
+    - "DOT/USDT"
+    - "BNB/USDT"
+  ```
+</ParamField>
+
+<ParamField path="bot.timeframe" type="string" default="1m">
+  Base OHLCV candle interval passed to the CCXT `fetch_ohlcv` call. Standard values: `1m`, `5m`, `15m`, `1h`, `4h`, `1d`. Overridden by `dynamic_timeframe` when that feature is enabled.
+</ParamField>
+
+<ParamField path="bot.dynamic_timeframe.enabled" type="boolean" default="true">
+  When `true`, the bot automatically switches between `active_timeframe` and `passive_timeframe` based on the current UTC hour, reducing false signals during low-volume periods.
+</ParamField>
+
+<ParamField path="bot.dynamic_timeframe.active_hours_utc.start" type="integer" default="13">
+  UTC hour at which the high-volatility trading window opens and the bot switches to `active_timeframe`.
+</ParamField>
+
+<ParamField path="bot.dynamic_timeframe.active_hours_utc.end" type="integer" default="17">
+  UTC hour at which the high-volatility window closes and the bot reverts to `passive_timeframe`.
+</ParamField>
+
+<ParamField path="bot.dynamic_timeframe.active_timeframe" type="string" default="1m">
+  Candle interval used during active hours (higher volatility, faster signal detection).
+</ParamField>
+
+<ParamField path="bot.dynamic_timeframe.passive_timeframe" type="string" default="5m">
+  Candle interval used outside active hours. The bot only evaluates signals when the candle is fully closed (i.e. when the current minute is a multiple of 5), preventing repainting artefacts.
+</ParamField>
+
+<ParamField path="bot.base_currency" type="string" default="USDT">
+  Quote currency used for portfolio valuation and risk calculations.
+</ParamField>
+
+<ParamField path="bot.fiat_currency" type="string" default="CLP">
+  Local fiat currency for humanised Telegram reports. The bot fetches the current USD→CLP exchange rate from `mindicador.cl` when generating reports.
+</ParamField>
+
+---
+
+### `risk` — Risk Management
+
+<ParamField path="risk.max_open_positions" type="integer" default="10">
+  Maximum number of simultaneously open positions across all trading pairs. The Risk Manager blocks any new BUY signal when this limit is reached.
+</ParamField>
+
+<ParamField path="risk.max_capital_exposure_pct" type="float" default="1.00">
+  Maximum fraction of total portfolio capital that can be deployed in open positions at any time (`1.00` = 100%).
+</ParamField>
+
+<ParamField path="risk.coin_reserve_pct" type="float" default="0.25">
+  Fraction of the per-pair allocation reserved and not deployable in any single order (`0.25` = 25% reserve).
+</ParamField>
+
+<ParamField path="risk.max_coin_order_pct" type="float" default="0.75">
+  Maximum fraction of the per-pair allocation that can be used in a single order (`0.75` = 75% of the pair's capital).
+</ParamField>
+
+<ParamField path="risk.min_order_usd" type="float" default="0.10">
+  Minimum order size in USD. Orders calculated below this threshold are skipped.
+</ParamField>
+
+<ParamField path="risk.max_loss_per_trade_pct" type="float" default="0.02">
+  Maximum loss allowed per individual trade as a fraction of the position value (`0.02` = 2%). Used by the Risk Manager to calculate the stop-loss price at entry.
+</ParamField>
+
+<ParamField path="risk.daily_loss_limit_pct" type="float" default="0.05">
+  If total realised losses for the current calendar day exceed this fraction of portfolio value (`0.05` = 5%), the bot halts all new entries for the remainder of the day.
+</ParamField>
+
+<ParamField path="risk.max_drawdown_pct" type="float" default="0.20">
+  Maximum peak-to-trough drawdown allowed before the bot pauses trading entirely (`0.20` = 20%). Resets on a new portfolio peak.
+</ParamField>
+
+<ParamField path="risk.default_take_profit_pct" type="float" default="0.04">
+  Default take-profit target as a fraction of entry price (`0.04` = 4%). Used in `target` mode or when no agent-specific override is set.
+</ParamField>
+
+<ParamField path="risk.trailing_stop" type="boolean" default="true">
+  Enables the dynamic trailing stop that moves the exit price upward as the position gains, locking in profit.
+</ParamField>
+
+<ParamField path="risk.trailing_stop_positive" type="float" default="0.02">
+  Trail distance as a fraction below the position's highest observed price (`0.02` = 2% below peak). Active only when `trailing_stop: true`.
+</ParamField>
+
+#### Time Stop (`risk.time_stop`)
+
+The time-based stop exits stale positions that have not reached take-profit after a minimum hold period, protecting capital from being locked indefinitely.
+
+<ParamField path="risk.time_stop.enabled" type="boolean" default="true">
+  Enable or disable the time-based stop entirely.
+</ParamField>
+
+<ParamField path="risk.time_stop.min_duration_minutes" type="integer" default="120">
+  Minimum number of minutes a position must be open before the time stop is evaluated.
+</ParamField>
+
+<ParamField path="risk.time_stop.consecutive_cycles_required" type="integer" default="3">
+  Number of consecutive `run_cycle` evaluations that must find the position in a loss zone before the time stop triggers. This multi-cycle guard prevents premature exits on transient dips.
+</ParamField>
+
+<ParamField path="risk.time_stop.max_loss_pct" type="float" default="0.02">
+  Maximum loss threshold at which the time stop will exit (`0.02` = −2%). Positions losing more than this after the minimum duration will be closed.
+</ParamField>
+
+<ParamField path="risk.time_stop.hard_stop_loss_pct" type="float" default="0.045">
+  Absolute emergency stop-loss. If a position drops more than this fraction from entry (`0.045` = −4.5%), it is closed immediately regardless of duration or consecutive-cycle requirements.
+</ParamField>
+
+<ParamField path="risk.time_stop.oversold_grace_enabled" type="boolean" default="true">
+  When `true`, the time stop is temporarily suspended if the bot detects oversold conditions or an emerging bounce, giving the position a grace period to recover.
+</ParamField>
+
+#### Market Bias Filter (`risk.market_bias`)
+
+This filter uses Bitcoin's 1-hour EMA trend to approve or block altcoin entries, avoiding entries during macro downtrends.
+
+<ParamField path="risk.market_bias.enabled" type="boolean" default="true">
+  Enable or disable the BTC macro trend filter for altcoin entries.
+</ParamField>
+
+<ParamField path="risk.market_bias.btc_symbol" type="string" default="BTC/USDT">
+  Symbol used as the macro reference asset.
+</ParamField>
+
+<ParamField path="risk.market_bias.timeframe" type="string" default="1h">
+  Candle interval for the macro EMA calculation.
+</ParamField>
+
+<ParamField path="risk.market_bias.ema_period" type="integer" default="50">
+  EMA period for the macro trend signal. If BTC/USDT price is below this EMA, altcoin BUY signals are blocked.
+</ParamField>
+
+<ParamField path="risk.market_bias.cache_ttl_seconds" type="integer" default="60">
+  Seconds to cache the market bias result before re-fetching, avoiding redundant exchange calls on every cycle.
+</ParamField>
+
+#### Micro DCA (`risk.micro_dca`)
+
+Splits each position entry into two tranches — an initial buy and a second buy on a pullback — to achieve a lower average entry price.
+
+<ParamField path="risk.micro_dca.enabled" type="boolean" default="true">
+  Enable or disable split-entry (Micro DCA) order execution.
+</ParamField>
+
+<ParamField path="risk.micro_dca.initial_tranche_pct" type="float" default="0.5333">
+  Fraction of the total order size deployed in the first tranche (~53.3%).
+</ParamField>
+
+<ParamField path="risk.micro_dca.pullback_tranche_pct" type="float" default="0.4667">
+  Fraction of the total order size deployed in the second tranche on pullback (~46.7%).
+</ParamField>
+
+<ParamField path="risk.micro_dca.pullback_min_pct" type="float" default="0.006">
+  Minimum price pullback from the first-tranche entry required to trigger the second tranche (`0.006` = −0.6%).
+</ParamField>
+
+<ParamField path="risk.micro_dca.pullback_max_pct" type="float" default="0.025">
+  Maximum price pullback within which the second tranche will still execute (`0.025` = −2.5%). Pullbacks deeper than this are treated as a trend reversal, not a DCA opportunity.
+</ParamField>
+
+#### Profit Harvest (`risk.profit_harvest`)
+
+Automatically liquidates extraordinary gains above a threshold back into the base currency reserve.
+
+<ParamField path="risk.profit_harvest.enabled" type="boolean" default="true">
+  Enable or disable automatic profit harvesting.
+</ParamField>
+
+<ParamField path="risk.profit_harvest.threshold_pct" type="float" default="1.00">
+  Unrealised gain as a fraction of entry cost that triggers harvesting (`1.00` = +100% gain on the position).
+</ParamField>
+
+<ParamField path="risk.profit_harvest.threshold_usd" type="float" default="15.00">
+  Unrealised gain in USD that triggers harvesting. Both `threshold_pct` and `threshold_usd` must be met for harvesting to occur.
+</ParamField>
+
+<ParamField path="risk.profit_harvest.harvest_ratio" type="float" default="1.00">
+  Fraction of the position to liquidate when harvesting triggers (`1.00` = close the entire position).
+</ParamField>
+
+---
+
+### `strategies` — Strategy Selection
+
+<ParamField path="strategies.active" type="string" default="ema_crossover">
+  Name of the strategy module the bot loads for signal generation. The only fully implemented strategy is `ema_crossover`; `ema_macro` is available for macro-level agents.
+</ParamField>
+
+<ParamField path="strategies.ema_crossover.fast_period" type="integer" default="9">
+  Number of candles used to calculate the fast EMA line. A smaller value makes the line more reactive to recent price changes.
+</ParamField>
+
+<ParamField path="strategies.ema_crossover.slow_period" type="integer" default="21">
+  Number of candles used to calculate the slow EMA line. This line defines the primary trend direction.
+</ParamField>
+
+<ParamField path="strategies.ema_crossover.signal_type" type="string" default="ema">
+  Indicator type for the crossover calculation. Currently fixed to `ema` (Exponential Moving Average).
+</ParamField>
+
+---
+
+### `scheduler` — Automated Reports
+
+<ParamField path="scheduler.weekly_report.day" type="string" default="monday">
+  Day of the week on which the weekly portfolio summary report is generated and sent (lowercase English day name).
+</ParamField>
+
+<ParamField path="scheduler.weekly_report.hour" type="integer" default="8">
+  Hour of the day (0–23) at which the report is dispatched, interpreted in the configured `timezone`.
+</ParamField>
+
+<ParamField path="scheduler.weekly_report.minute" type="integer" default="0">
+  Minute (0–59) within the configured hour at which the report is dispatched.
+</ParamField>
+
+<ParamField path="scheduler.weekly_report.timezone" type="string" default="America/Santiago">
+  IANA timezone string used to interpret `hour` and `minute`. Change this to your local timezone to receive reports at a convenient local time.
+</ParamField>
+
+---
+
+### `logging` — Log Management
+
+<ParamField path="logging.level" type="string" default="INFO">
+  Minimum log severity level. Mirrors the `LOG_LEVEL` environment variable; the env var takes precedence if both are set.
+</ParamField>
+
+<ParamField path="logging.rotation" type="string" default="1 day">
+  Loguru rotation schedule. Log files are rotated and compressed on this interval. Examples: `"500 MB"`, `"1 week"`, `"1 day"`.
+</ParamField>
+
+<ParamField path="logging.retention" type="string" default="30 days">
+  How long rotated log archives are kept before deletion. Prevents unbounded disk growth on long-running deployments.
+</ParamField>
+
+<ParamField path="logging.format" type="string" default="json">
+  Log output format. `json` produces structured records compatible with log aggregation platforms (ELK Stack, Grafana Loki, etc.).
+</ParamField>
+
+---
+
+## Full `config.yaml`
+
+<Accordion title="View complete config.yaml">
+```yaml
+bot:
+  # Nombre interno del bot para referencias y logs
+  name: "TradingBot"
+  
+  # Modo de operación general. 'passive' solo recolecta datos, 'active' opera, 'both' hace ambas cosas.
+  mode: "passive"                  
+  # Modo de operación de la lógica de trading: 'trend' (corta pérdidas rápido) o 'target' (solo cierra en ganancias).
+  trading_mode: "scalper"
+  
+  # Lista de pares de criptomonedas a operar. El formato debe ser MONEDA/BASE (ej. BTC/USDT).
+  trading_pairs:
+    - "BTC/USDT"
+    - "ETH/USDT"
+    - "SOL/USDT"
+    - "AVAX/USDT"
+    - "XRP/USDT"
+    - "DOGE/USDT"
+    - "ADA/USDT"
+    - "LINK/USDT"
+    - "DOT/USDT"
+    - "BNB/USDT"
+  
+  # Marco de tiempo general (timeframe) para analizar velas. '1m' = 1 minuto, '5m' = 5 minutos, '1h' = 1 hora.
+  timeframe: "1m"                  
+  
+  # Configuración para alternar automáticamente el timeframe según la hora del día (útil para gestionar volatilidad).
+  dynamic_timeframe:
+    # Activar o desactivar el cambio automático de timeframe.
+    enabled: true
+    # Rango de horas (en UTC) donde el mercado tiene mayor movimiento para operar más rápido.
+    active_hours_utc:
+      start: 13
+      end: 17
+    # Timeframe usado durante las 'active_hours_utc' (mercado volátil, ej. 1 minuto).
+    active_timeframe: "1m"
+    # Timeframe usado el resto del día (mercado más lento, ej. 5 minutos) para evitar falsas señales.
+    passive_timeframe: "5m"
+  
+  # Moneda base contra la que se valora la billetera y las métricas de riesgo (comúnmente USDT o USD).
+  base_currency: "USDT"
+  
+  # Moneda fiduciaria local para enviar reportes financieros humanizados por Telegram (CLP = Peso Chileno).
+  fiat_currency: "CLP"             
+
+risk:
+  # Número máximo de posiciones simultáneas que el bot tiene permitido mantener abiertas.
+  max_open_positions: 10
+  
+  # Porcentaje máximo del capital total permitido para operar.
+  max_capital_exposure_pct: 1.00
+  
+  # Reserva individual por par de moneda (0.25 = 25% reservado, orden máx 0.75 = $0.75 USD con base $1.00 USD)
+  coin_reserve_pct: 0.25
+  max_coin_order_pct: 0.75
+  min_order_usd: 0.10
+  
+  # Pérdida máxima permitida por cada operación individual (0.02 = 2%). Sirve para calcular el Stop Loss.
+  max_loss_per_trade_pct: 0.02
+  
+  # Límite global de pérdida diaria (0.05 = 5%). Si se pierde esto en 1 día, el bot dejará de operar por seguridad.
+  daily_loss_limit_pct: 0.05
+  
+  # Límite de racha de pérdidas histórica (0.20 = 20%). Si la cuenta cae este porcentaje desde su pico, detiene operaciones.
+  max_drawdown_pct: 0.20
+  
+  # Porcentaje de ganancia objetivo por defecto para cerrar posiciones de forma estática (0.04 = 4%).
+  default_take_profit_pct: 0.04
+  
+  # Habilitar el cierre dinámico de ganancias (Stop Loss que sigue el precio hacia arriba).
+  trailing_stop: true
+  
+  # Distancia porcentual del Trailing Stop respecto al pico máximo del precio (0.02 = 2%).
+  trailing_stop_positive: 0.02
+
+  # Salida por Tiempo Inteligente (Time-Based Stop) con seguro multi-ciclo
+  time_stop:
+    enabled: true
+    min_duration_minutes: 120
+    consecutive_cycles_required: 3
+    max_loss_pct: 0.02
+    hard_stop_loss_pct: 0.045
+    oversold_grace_enabled: true
+
+  # Filtro de Tendencia Macro de Bitcoin para Altcoins
+  market_bias:
+    enabled: true
+    btc_symbol: "BTC/USDT"
+    timeframe: "1h"
+    ema_period: 50
+    cache_ttl_seconds: 60
+
+  # Entrada Escalonada (Order Splitting / Micro DCA)
+  micro_dca:
+    enabled: true
+    initial_tranche_pct: 0.5333
+    pullback_tranche_pct: 0.4667
+    pullback_min_pct: 0.006
+    pullback_max_pct: 0.025
+
+  # Cosecha Automática de Ganancias (Profit Harvesting)
+  profit_harvest:
+    enabled: true
+    threshold_pct: 1.00
+    threshold_usd: 15.00
+    harvest_ratio: 1.00
+
+strategies:
+  # Nombre de la estrategia principal que utilizará el bot para generar las señales de BUY/SELL.
+  active: "ema_crossover"
+  
+  # Configuración específica para la estrategia de Cruce de Medias Móviles Exponenciales (EMA).
+  ema_crossover:
+    # Período (cantidad de velas) para la línea rápida. Sigue el precio muy de cerca.
+    fast_period: 9
+    # Período (cantidad de velas) para la línea lenta. Marca la tendencia principal.
+    slow_period: 21
+    # Tipo de señal de cruce, indica que usaremos medias exponenciales.
+    signal_type: "ema"
+
+scheduler:
+  # Configuración de los reportes semanales automáticos que llegan a Telegram o Correo.
+  weekly_report:
+    # Día de la semana en que se genera el resumen (inglés).
+    day: "monday"
+    # Hora de emisión del reporte (0-23).
+    hour: 8
+    # Minuto exacto de emisión (0-59).
+    minute: 0
+    # Zona horaria para sincronizar los reportes con la vida real del usuario.
+    timezone: "America/Santiago"
+
+logging:
+  # Nivel mínimo de detalle para registrar eventos (DEBUG = Todo, INFO = Normal, ERROR = Solo fallos).
+  level: "INFO"
+  # Cada cuánto tiempo se rota y comprime el archivo de logs para no llenar el disco duro.
+  rotation: "1 day"
+  # Cuánto tiempo se conservan los logs antiguos antes de ser eliminados permanentemente.
+  retention: "30 days"
+  # Formato del log (útil si se exporta a ELK u otras herramientas de observabilidad).
+  format: "json"
+```
+</Accordion>

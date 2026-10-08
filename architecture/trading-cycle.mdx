@@ -1,0 +1,309 @@
+---
+title: "The Trading Cycle: How Each Agent Evaluates the Market"
+sidebarTitle: "Trading Cycle"
+description: "A step-by-step breakdown of the 60-second run_cycle loop: anti-repainting guard, dynamic timeframe, concurrent symbol evaluation, EMA signal, risk gates, and order execution."
+---
+
+Every 60 seconds, APScheduler fires a synchronous wrapper that hands control to an async `run_cycle()` coroutine. This coroutine performs a single pass over all symbols assigned to the agent — every symbol is evaluated concurrently via `asyncio.gather()`, with each evaluation running the full decision pipeline: anti-repainting guard, OHLCV fetch, EMA signal generation, open-trade exit management, BTC macro bias check, risk validation, Micro DCA order sizing, and finally a bulk `DecisionLog` write to SQLite. Understanding this pipeline is essential for tuning take-profit targets, adjusting timeframes, or adding new risk filters.
+
+## The Cycle Pipeline
+
+<Steps>
+  <Step title="APScheduler fires _run_cycle_sync()">
+    APScheduler's `BackgroundScheduler` triggers the synchronous wrapper `_run_cycle_sync()` on a 1-minute interval. This wrapper calls `asyncio.run(self.run_cycle())`, creating a fresh event loop for each cycle. Each sub-agent runs its own independent scheduler, so all four agents can fire simultaneously without contention.
+
+    ```python
+    # agents/base_agent.py — scheduler registration in start()
+    self.scheduler.add_job(
+        self._run_cycle_sync,
+        "interval",
+        minutes=1,
+        id=f"cycle_{self.agent_id}"
+    )
+    self.scheduler.start()
+    ```
+
+    ```python
+    # agents/base_agent.py — sync wrapper
+    def _run_cycle_sync(self):
+        """Wrapper síncrono para llamar desde el scheduler."""
+        try:
+            asyncio.run(self.run_cycle())
+        except Exception as e:
+            log.error(f"[{self.agent_name}] Error en run_cycle_sync: {e}")
+    ```
+  </Step>
+
+  <Step title="Paused check — skip if PASSIVE">
+    The very first thing `run_cycle()` does is check whether the agent is paused. If `self.paused` is `True` (i.e., the agent is in `PASSIVE` mode), the cycle is skipped entirely and returns immediately with a log message. No exchange calls, no DB writes.
+
+    ```python
+    # agents/base_agent.py — run_cycle()
+    async def run_cycle(self):
+        """Ciclo principal de evaluación del subagente."""
+        if self.paused:
+            log.info(f"[{self.agent_name}] En modo PASSIVE. Ciclo omitido.")
+            return
+    ```
+  </Step>
+
+  <Step title="Dynamic timeframe selection">
+    Each agent resolves its active timeframe at the start of every cycle. If `dynamic_timeframe.enabled` is `true` in the agent's YAML, the current UTC hour is compared against the configured `active_hours_utc` window. Inside the window, the `active_timeframe` is used; outside, the `passive_timeframe` is used.
+
+    For `ScalperAgent`, this means 1-minute candles between 13:00–21:00 UTC and 5-minute candles outside that window. `MacroTraderAgent` switches between 15-minute (during the 13:00–17:00 NY/London overlap) and 1-hour candles at night.
+
+    ```python
+    # agents/base_agent.py — _get_current_timeframe()
+    def _get_current_timeframe(self) -> str:
+        dt_cfg = self.config.bot.dynamic_timeframe
+        if dt_cfg and dt_cfg.enabled:
+            current_hour = datetime.utcnow().hour
+            start_hr = dt_cfg.active_hours_utc.start
+            end_hr = dt_cfg.active_hours_utc.end
+
+            if start_hr < end_hr:
+                is_active = start_hr <= current_hour < end_hr
+            else:
+                is_active = current_hour >= start_hr or current_hour < end_hr
+
+            return dt_cfg.active_timeframe if is_active else dt_cfg.passive_timeframe
+        return self.config.bot.timeframe
+    ```
+  </Step>
+
+  <Step title="Anti-repainting guard">
+    When the active timeframe is greater than 1 minute (e.g., `5m`, `15m`), the agent checks whether the current minute aligns with the candle boundary. If the current minute is **not** a multiple of the timeframe interval, the cycle is aborted. This prevents trading on an unclosed, still-forming candle — the primary cause of indicator repainting in live trading systems.
+
+    ```python
+    # agents/base_agent.py — anti-repainting check inside run_cycle()
+    if current_tf.endswith("m"):
+        tf_mins = int(current_tf.replace("m", ""))
+        current_min = datetime.utcnow().minute
+        if tf_mins > 1 and current_min % tf_mins != 0:
+            log.info(
+                f"[{self.agent_name}] Esperando cierre de vela {current_tf}. "
+                f"Minuto: {current_min}"
+            )
+            decisions = [
+                {"symbol": s, "decision": "HOLD", "reason": f"Waiting for {current_tf} candle close"}
+                for s in self.config.bot.trading_pairs
+            ]
+            await self.portfolio_manager.record_decisions_bulk_async(decisions)
+            return
+    ```
+
+    <Tip>
+      On a 5-minute timeframe, the cycle will execute only at minutes 0, 5, 10, 15, … The remaining 4 out of every 5 scheduler fires result in a bulk `HOLD` log and an early return.
+    </Tip>
+  </Step>
+
+  <Step title="Market pre-load and concurrent symbol gather">
+    Before dispatching symbol tasks, the agent calls `connector.ensure_markets_loaded()` once per cycle. This populates the CCXT exchange's internal market metadata from the 24-hour cache, avoiding a slow `load_markets()` HTTP call inside each individual symbol task.
+
+    All symbols are then dispatched concurrently with a single `asyncio.gather()`:
+
+    ```python
+    # agents/base_agent.py — concurrent symbol processing
+    capital = await self._get_assigned_capital()
+
+    # Asegurar mercados en memoria antes del gather concurrente
+    await connector.ensure_markets_loaded()
+
+    tasks = [
+        self.trade_engine.process_symbol(
+            symbol, current_tf, capital, data_collector, order_executor
+        )
+        for symbol in self.config.bot.trading_pairs
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    ```
+
+    Each task returns a dict `{"symbol": ..., "decision": ..., "reason": ...}`. Exceptions are caught individually — a network error on one symbol does not abort the evaluation of the remaining symbols.
+  </Step>
+
+  <Step title="TradeEngine.process_symbol() — the decision pipeline">
+    For each symbol, `TradeEngine.process_symbol()` runs the following sequence:
+
+    1. **Fetch OHLCV** — `DataCollector.get_historical_data()` requests enough candles to fully warm up the EMA slow period (`max(50, slow_period + 50)`).
+    2. **Generate signal** — `strategy.generate_signal(df)` returns `"BUY"`, `"SELL"`, or `"HOLD"`.
+    3. **Update portfolio price** — the latest close price is written to the `Portfolio` table asynchronously.
+    4. **Manage open trades** — `manage_open_trades()` checks every open position for TP, SL, Hard Stop, and Safe Time-Stop exits before evaluating new entries.
+    5. **BTC macro bias filter** — for non-BTC symbols, if BTC's EMA-50 on the 1-hour chart is bearish, new BUY entries are blocked.
+    6. **Risk gate** — `RiskManager.can_open_position()` checks the agent's `max_open_positions` cap. `check_daily_loss()` enforces the daily loss limit.
+    7. **Micro DCA sizing** — if `micro_dca.enabled`, the order is split into two tranches: Tranche 1 (~53.33% of the coin's budget) on the initial BUY signal, and Tranche 2 (~46.67%) if price pulls back between `pullback_min_pct` (0.6%) and `pullback_max_pct` (2.5%) from the entry.
+    8. **Execute order** — `OrderExecutor.execute_order()` places a paper mock or real MARKET order.
+    9. **Record to DB** — `PortfolioManager.record_open_trade_async()` persists the trade to SQLite.
+
+    ```python
+    # tradingbot/engine/trade_engine.py — process_symbol() summary
+    async def process_symbol(self, symbol, current_tf, total_capital,
+                              data_collector, order_executor, agent_id=None):
+        slow_period = getattr(self.strategy, "slow_period", 21)
+        limit = max(50, slow_period + 50)
+        df = await data_collector.get_historical_data(
+            symbol=symbol, timeframe=current_tf, limit=limit
+        )
+        signal = self.strategy.generate_signal(df)
+        current_price = float(df['close'].iloc[-1])
+        await self.portfolio_manager.update_asset_price_async(symbol, current_price)
+
+        # 1. Manage exits first
+        close_result = await self.manage_open_trades(
+            symbol, current_price, signal, order_executor, total_capital, agent_id
+        )
+        if close_result:
+            return close_result
+
+        # 2. Evaluate new entries (BUY + Micro DCA logic follows)
+        ...
+    ```
+  </Step>
+
+  <Step title="Exit management — TP, SL, Hard Stop, Safe Time-Stop">
+    `manage_open_trades()` is called before any new entry logic. It iterates every open trade for the symbol and evaluates four exit conditions in priority order:
+
+    | Priority | Trigger | Condition |
+    |---|---|---|
+    | 1 | **Hard Stop Loss** | `pnl_pct ≤ −4.5%` — Flash crash emergency exit, all trading modes |
+    | 2 | **Take Profit** | `price ≥ entry × (1 + tp_pct)` — 4% for Scalper, 5% for Momentum, 1.5% for Macro |
+    | 3 | **Stop Loss / Reversal** | `price ≤ entry × (1 − sl_pct)` or `signal == "SELL"` — `trend` mode only |
+    | 4 | **Safe Time-Stop** | Trade age ≥ 120 min AND 3 consecutive cycles in loss — `scalper` mode only |
+
+    The Safe Time-Stop uses a per-trade cycle counter (`time_stop_tracker`) to require 3 consecutive cycles confirming the loss before exiting. A price bounce that crosses back to positive PnL resets the counter:
+
+    ```python
+    # tradingbot/engine/trade_engine.py — Safe Time-Stop logic
+    elif not should_close and trading_mode == "scalper" and ts_cfg:
+        min_duration = getattr(ts_cfg, "min_duration_minutes", 120)
+        consecutive_req = getattr(ts_cfg, "consecutive_cycles_required", 3)
+
+        if duration_minutes >= min_duration:
+            if pnl_pct < 0:
+                c_count = self.time_stop_tracker.get(trade.trade_id, 0) + 1
+                self.time_stop_tracker[trade.trade_id] = c_count
+                if c_count >= consecutive_req:
+                    should_close = True
+                    close_reason = (
+                        f"Safe Time-Stop ({int(duration_minutes)}m + "
+                        f"{c_count}x Confirmado, PnL {pnl_pct*100:.2f}%)"
+                    )
+            else:
+                # Bounce to positive — reset the counter
+                self.time_stop_tracker.pop(trade.trade_id, None)
+    ```
+  </Step>
+
+  <Step title="DecisionLog persistence">
+    After all symbol tasks complete, the results are collected and written to the `DecisionLog` table in a single bulk insert via `record_decisions_bulk_async()`. Every decision — `BUY`, `SELL`, `HOLD`, `BLOCKED`, `CLOSED`, `ERROR` — is recorded with its symbol, reason, and timestamp. This feed powers the evaluation counters visible in the `/status` Telegram panel.
+
+    ```python
+    # agents/base_agent.py — bulk decision persistence
+    bulk_decisions = []
+    for result in results:
+        if isinstance(result, Exception):
+            log.error(f"[{self.agent_name}] Error en gather: {result}")
+        elif isinstance(result, dict):
+            bulk_decisions.append(result)
+
+    if bulk_decisions:
+        await self.portfolio_manager.record_decisions_bulk_async(bulk_decisions)
+
+    self._cycle_count += 1
+    ```
+  </Step>
+</Steps>
+
+## Active Mode vs Passive Mode
+
+The agent's `trading_mode` field (from the YAML `bot.trading_mode`) is distinct from its `mode` (active/passive). `trading_mode` controls **how the TradeEngine exits positions**, not whether cycles run.
+
+<Tabs>
+  <Tab title="scalper mode">
+    Used by `ScalperAgent` and `SpeculativeAgent`. Take Profit at +4–6%, Hard Stop at -4.5%, and the Safe Time-Stop after 120 minutes of continuous loss. Strategy reversal signals (SELL) are **not** used as exit triggers — only TP, SL, and the time-based exit apply.
+  </Tab>
+  <Tab title="target mode">
+    Used by `MomentumAgent`. Only exits on Take Profit (+5%). No Stop Loss on reversal signals. The assumption is that high-narrative assets (FET, STRK, TAO) will eventually reach the target given sufficient time. The Hard Stop at -4.5% remains active as an emergency floor.
+  </Tab>
+  <Tab title="trend mode">
+    Used by `MacroTraderAgent`. Closes on TP (+1.5%), SL (-1.5%), **and** on a SELL signal (strategy reversal). This is the most responsive mode, designed for macro-trend following where holding against a reversal signal compounds losses quickly.
+  </Tab>
+</Tabs>
+
+## Micro DCA — Two-Tranche Entry
+
+When `micro_dca.enabled: true`, a BUY signal does not immediately commit the full coin budget. Instead it is split into two tranches:
+
+```
+Tranche 1 (initial):  ~53.33% of coin budget  → executed on BUY signal
+Tranche 2 (pullback): ~46.67% of coin budget  → executed if price retraces -0.6% to -2.5%
+```
+
+If Tranche 2 fires, `PortfolioManager.consolidate_dca_position_async()` recalculates the weighted average entry price and increments `dca_step` to `2` on the existing trade record. A symbol with `dca_step == 2` will not trigger further DCA entries, even if another BUY signal appears.
+
+```python
+# tradingbot/engine/trade_engine.py — Tranche 2 trigger check
+if is_dca_enabled and dca_step == 1:
+    entry_price = float(existing_trade.price_entry)
+    price_drop = (entry_price - current_price) / entry_price
+    pullback_min = getattr(micro_dca_cfg, "pullback_min_pct", 0.006)
+    pullback_max = getattr(micro_dca_cfg, "pullback_max_pct", 0.025)
+
+    if pullback_min <= price_drop <= pullback_max:
+        tranche_2_pct = getattr(micro_dca_cfg, "pullback_tranche_pct", 0.4667)
+        order_usd_2 = min(
+            round(full_coin_alloc * tranche_2_pct, 4), available_cash
+        )
+        exec_res_2 = await order_executor.execute_order(
+            symbol=symbol, side="BUY", amount=order_usd_2 / current_price,
+            order_type="MARKET", price=current_price
+        )
+        updated_trade = await self.portfolio_manager.consolidate_dca_position_async(
+            existing_trade.trade_id, exec_res_2, dca_step=2
+        )
+```
+
+## BTC Market Bias Filter
+
+For every altcoin BUY signal, `BTCMarketBiasFilter.get_btc_bias()` checks whether BTC is above its EMA-50 on the 1-hour chart. If BTC is bearish, the altcoin BUY is blocked regardless of its own EMA signal. The filter result is cached for 60 seconds (`cache_ttl_seconds: 60`) to avoid redundant HTTP calls when multiple symbols fire BUY signals in the same cycle.
+
+```python
+# tradingbot/engine/trade_engine.py — BTC Macro Bias check
+if symbol != "BTC/USDT":
+    bias_cfg = getattr(self.config.risk, "market_bias", None)
+    if bias_cfg and getattr(bias_cfg, "enabled", True):
+        bias, bias_reason = await self.market_bias_filter.get_btc_bias(data_collector)
+        if bias == "BEARISH":
+            log.warning(
+                f"[{agent_id}] Compra en {symbol} bloqueada por BTC Market Bias: "
+                f"{bias_reason}"
+            )
+            return {
+                'symbol': symbol,
+                'decision': 'BLOCKED',
+                'reason': f"BTC Macro Bias Bearish ({bias_reason})"
+            }
+```
+
+<Warning>
+  The BTC bias filter is disabled for `MacroTraderAgent` (BTC/ETH only trades BTC itself) and can be disabled per-agent by setting `market_bias.enabled: false` in the agent's YAML. Disabling it during a bear market will increase the `BLOCKED` → `BUY` conversion rate but also increase losing trades.
+</Warning>
+
+## Coin Fund Exhaustion
+
+Every coin starts with a $1.00 USD base investment. When a coin's cumulative realized PnL drives its balance to $0.00 or below, all further BUY entries for that coin are blocked and a markdown forensic report is generated:
+
+```python
+# tradingbot/engine/trade_engine.py — fund exhaustion check
+coin_balance = base_coin_usd + coin_realized_pnl  # base_coin_usd = 1.0
+if coin_balance <= 0.0:
+    log.warning(
+        f"[{agent_id}] Fondo de {symbol} agotado (${coin_balance:.2f} USD). Estado: OFF."
+    )
+    return {
+        'symbol': symbol,
+        'decision': 'BLOCKED',
+        'reason': f"Fondo agotado (${coin_balance:.2f} USD) | Estado OFF"
+    }
+```
+
+The coin transitions to **OFF** in the operational matrix and a Telegram alert is sent with the path to the generated report file. The coin can be re-enabled by manually replenishing its capital through the deposit workflow.

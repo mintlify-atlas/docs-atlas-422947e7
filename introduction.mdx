@@ -1,0 +1,67 @@
+---
+title: "Trading Agent Bot: Autonomous Crypto Trading via Telegram"
+sidebarTitle: "Introduction"
+description: "An asynchronous multi-agent Python trading bot connecting to Binance via CCXT, controlled entirely through Telegram with built-in risk management and paper trading."
+---
+
+Trading Agent Bot is an open-source, asynchronous cryptocurrency trading system that coordinates four independent sub-agents — each running its own strategy and capital pool — under a single orchestrator. The bot connects to Binance (or Binance Testnet) through the CCXT library, evaluates EMA crossover signals on a per-cycle basis, and executes or simulates trades automatically. Every aspect of operation — starting and stopping agents, switching trading modes, reviewing portfolio performance, depositing virtual capital, and receiving scheduled reports — is accessible through a private Telegram chat, making the bot fully operable from a mobile device with no terminal access required.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Clone the repo, configure your credentials, and have the bot running in paper-trading mode in under ten minutes.
+  </Card>
+  <Card title="Configuration" icon="sliders" href="/configuration">
+    Deep-dive into every environment variable and `config.yaml` key that controls bot behaviour, risk limits, and scheduling.
+  </Card>
+  <Card title="Architecture Overview" icon="diagram-project" href="/architecture/overview">
+    Understand how the Orchestrator, four sub-agents, Trade Engine, and Risk Manager interact at runtime.
+  </Card>
+  <Card title="Telegram Commands" icon="paper-plane" href="/telegram/commands">
+    Full reference for every `/command` available in the Telegram interface, from `/start` to `/cashflow`.
+  </Card>
+</CardGroup>
+
+## What the Bot Does
+
+At its core, Trading Agent Bot runs a continuous `run_cycle` loop — waking every 60 seconds, pulling OHLCV candle data for each configured trading pair, evaluating the active EMA crossover strategy, and acting on BUY or SELL signals within the boundaries set by the Risk Manager. The cycle is clock-aware: during high-volatility hours (13:00–17:00 UTC by default) it operates on 1-minute candles; outside those hours it steps back to 5-minute candles to filter out false signals caused by low-volume noise.
+
+All trade history, portfolio snapshots, and candle data are persisted to a local SQLite database (configurable via `DATABASE_URL`), which doubles as a silent dataset-collection layer for a planned machine-learning upgrade phase.
+
+## Key Capabilities
+
+- **Multi-agent orchestration** — Four specialised sub-agents share the capital pool and run isolated strategy cycles in background threads coordinated by `OrchestratorBot`.
+- **EMA crossover strategy** — Configurable fast (default 9) and slow (default 21) EMA periods generate BUY/SELL signals; a macro EMA filter on BTC/USDT guards altcoin entries.
+- **Paper trading mode** — A fully isolated virtual wallet mirrors real exchange mechanics with no real money at risk. Enabled by default (`PAPER_TRADING=true`).
+- **Telegram UI** — `/buy`, `/sell`, `/mode`, `/cashflow`, `/deposit`, `/expense`, `/status`, and more give complete control from any device.
+- **Automated risk management** — Per-trade stop-loss, daily loss limits, max drawdown circuit-breaker, trailing stop, time-based stop, and micro-DCA entry splitting run automatically every cycle.
+- **Profit harvesting** — When a position exceeds a configurable USD or percentage threshold, the bot liquidates gains automatically into the base currency reserve.
+- **Dynamic timeframes** — The bot switches between active-hours and passive-hours candle intervals automatically based on UTC time.
+- **Scheduled reports** — Weekly portfolio summaries are pushed to Telegram (and optionally email) on a configurable day and time.
+- **CLP conversion** — Profit metrics are translated to Chilean Pesos in real time via the `mindicador.cl` API for localised reporting.
+
+## The Four Sub-Agents
+
+Each agent operates its own strategy configuration, capital allocation, and cycle schedule. They are defined in the `configs/` directory and loaded by the orchestrator at startup.
+
+| Agent | Config File | Focus |
+|---|---|---|
+| **Scalper** | `configs/agent_scalper.yaml` | High-frequency, short-duration trades on tight EMA windows |
+| **Momentum** | `configs/agent_momentum.yaml` | Medium-term trend-following with wider EMA periods |
+| **Macro** | `configs/agent_macro.yaml` | Long-horizon positions guided by macro EMA signals |
+| **Speculative** | `configs/agent_speculative.yaml` | Higher-risk, higher-reward setups on volatile pairs |
+
+## Trading Modes
+
+The `trading_mode` setting (configurable in `config.yaml` or live via `/mode` in Telegram) controls how the bot handles losing positions:
+
+- **`trend`** — Cut losses fast. If the market reverses, stop-loss is applied aggressively. Best for bull markets with clear directional momentum.
+- **`target`** — Never close at a loss. Positions are held until the take-profit target is reached regardless of interim drawdown. Guarantees profitable closes but may lock up capital during sharp macro corrections.
+- **`scalper`** — Short-duration scalping mode with tight entry and exit windows, designed for the Scalper sub-agent's rapid cycle cadence.
+
+## Who This Is For
+
+Trading Agent Bot is aimed at Python developers and quantitative trading enthusiasts who want a production-grade, self-hosted bot they can understand, extend, and run without paying for cloud signal services. It is equally useful as a paper-trading learning environment for those studying algorithmic trading mechanics before committing real capital.
+
+<Note>
+  The project requires Python 3.10 or later. All async I/O is built on `asyncio` with `uvloop` for performance; scheduling runs through `APScheduler`; Telegram integration uses `python-telegram-bot` v22.
+</Note>

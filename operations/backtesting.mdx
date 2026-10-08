@@ -1,0 +1,273 @@
+---
+title: "Backtesting EMA Strategy on Historical Candle Data"
+sidebarTitle: "Backtesting"
+description: "Run offline backtests against accumulated OHLCV candle data using the backtesting library, and learn how candles are silently collected for ML training."
+---
+
+Trading Agent Bot accumulates historical OHLCV candle data silently in the background during every `run_cycle` and stores it in the `candles` table of `tradingbot.db`. This dataset drives the `backtests/run_backtest.py` script, which uses the [`backtesting`](https://kernc.github.io/backtesting.py/) library (v0.6.6) to replay EMA crossover strategies against real historical price data — without touching the live exchange.
+
+## How Candle Data Is Collected
+
+<Note>
+  Candle collection is fully automatic. Every time the bot fetches OHLCV data from Binance during a trading cycle, the `DataCollector._save_to_db_async()` method inserts new candles into the `candles` table (duplicate timestamps are silently ignored via a unique constraint on `symbol + timeframe + timestamp`). No manual step is required.
+</Note>
+
+The `DataCollector` class in `tradingbot/market/data_collector.py` is responsible for both serving market data to the strategy engine and persisting candles for future analysis:
+
+```python
+class DataCollector:
+    """
+    DataCollector fetches market data via the ExchangeConnector and processes it.
+    """
+
+    def __init__(self, connector: ExchangeConnector):
+        self.connector = connector
+
+    async def get_historical_data(
+        self, symbol: str, timeframe: str,
+        since: int | None = None, limit: int | None = None
+    ) -> pd.DataFrame:
+        ohlcv = await self.connector.fetch_ohlcv(symbol, timeframe, since, limit)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+
+        # ← persists rows to the candles table for ML training
+        await self._save_to_db_async(df, symbol, timeframe)
+        return df
+```
+
+The `_save_to_db_async` method queries the latest stored timestamp and only inserts candles newer than that watermark, keeping the table append-only and free of duplicates.
+
+## The Candle Database Model
+
+Each row in the `candles` table represents one OHLCV bar. The table is defined in `tradingbot/database/models.py`:
+
+```python
+class Candle(Base):
+    """
+    Tabla de datos históricos para futuro entrenamiento de Machine Learning.
+    Almacena el histórico silenciosamente en cada ciclo.
+    """
+    __tablename__ = 'candles'
+
+    id        = Column(Integer, primary_key=True)
+    symbol    = Column(String, nullable=False, index=True)
+    timeframe = Column(String, nullable=False)
+    timestamp = Column(DateTime, nullable=False, index=True)
+    open      = Column(Numeric(18, 8), nullable=False)
+    high      = Column(Numeric(18, 8), nullable=False)
+    low       = Column(Numeric(18, 8), nullable=False)
+    close     = Column(Numeric(18, 8), nullable=False)
+    volume    = Column(Numeric(18, 8), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('symbol', 'timeframe', 'timestamp', name='_symbol_tf_ts_uc'),
+    )
+```
+
+<Tip>
+  To maximise the quality of your backtests, let the bot accumulate data in multiple timeframes. Configure `bot.timeframe` in `config.yaml` to `1m` during active hours and `5m` during passive hours (via `dynamic_timeframe`) — this builds two separate candle series in parallel, letting you backtest both timeframes against the same real market periods.
+</Tip>
+
+## Running a Backtest
+
+The `backtests/run_backtest.py` script is the entry point for offline simulation. It loads candles from `tradingbot.db`, wraps the EMA crossover logic inside a `backtesting.py` `Strategy` subclass, and runs the simulation over the selected symbol and date range.
+
+### Prerequisites
+
+Install the `backtesting` library (already included in `requirements.txt`):
+
+```bash
+pip install backtesting==0.6.6
+```
+
+The following additional packages from `requirements.txt` are also used by the backtest runner:
+
+```
+pandas==3.0.6
+numpy==2.5.3
+bokeh==3.10.0       # interactive HTML report
+SQLAlchemy==2.1.1   # database access
+```
+
+### Adapting the EMA Crossover Strategy for `backtesting.py`
+
+The live strategy class (`EMACrossoverStrategy`) uses a `generate_signal()` interface driven by raw DataFrames. For `backtesting.py`, the logic is wrapped inside a `Strategy` subclass that uses the library's indicator API:
+
+```python
+#!/usr/bin/env python3
+"""
+backtests/run_backtest.py
+
+Offline EMA crossover backtest against stored candle data.
+Usage:
+    python backtests/run_backtest.py --symbol BTC/USDT --timeframe 1h --cash 50
+"""
+
+import argparse
+import sqlite3
+import pandas as pd
+from backtesting import Backtest, Strategy
+from backtesting.lib import crossover
+
+
+def load_candles(db_path: str, symbol: str, timeframe: str) -> pd.DataFrame:
+    """Load OHLCV candles from the local SQLite database."""
+    conn = sqlite3.connect(db_path)
+    df = pd.read_sql_query(
+        """
+        SELECT timestamp, open, high, low, close, volume
+        FROM candles
+        WHERE symbol = ? AND timeframe = ?
+        ORDER BY timestamp ASC
+        """,
+        conn,
+        params=(symbol, timeframe),
+        parse_dates=["timestamp"],
+        index_col="timestamp",
+    )
+    conn.close()
+    # backtesting.py expects title-cased column names
+    df.columns = ["Open", "High", "Low", "Close", "Volume"]
+    return df
+
+
+class EMACrossover(Strategy):
+    """
+    EMA 9/21 crossover strategy for backtesting.py.
+    Mirrors the logic in tradingbot/strategies/ema_crossover.py.
+    """
+    fast_period = 9    # configurable via bt.optimize()
+    slow_period = 21
+
+    def init(self):
+        close = self.data.Close
+        self.fast_ema = self.I(
+            lambda x: pd.Series(x).ewm(span=self.fast_period, adjust=False).mean().values,
+            close,
+            name=f"EMA{self.fast_period}",
+        )
+        self.slow_ema = self.I(
+            lambda x: pd.Series(x).ewm(span=self.slow_period, adjust=False).mean().values,
+            close,
+            name=f"EMA{self.slow_period}",
+        )
+
+    def next(self):
+        if crossover(self.fast_ema, self.slow_ema):
+            self.buy()
+        elif crossover(self.slow_ema, self.fast_ema):
+            self.sell()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run EMA backtest on stored candle data")
+    parser.add_argument("--symbol",    default="BTC/USDT",  help="Trading pair (default: BTC/USDT)")
+    parser.add_argument("--timeframe", default="1h",        help="Candle timeframe (default: 1h)")
+    parser.add_argument("--cash",      type=float, default=50.0, help="Starting capital in USD")
+    parser.add_argument("--db",        default="tradingbot.db",  help="Path to SQLite database")
+    args = parser.parse_args()
+
+    print(f"Loading candles: {args.symbol} @ {args.timeframe} from {args.db}")
+    df = load_candles(args.db, args.symbol, args.timeframe)
+
+    if df.empty:
+        print("❌ No candle data found. Let the bot run for at least one cycle to accumulate data.")
+        return
+
+    print(f"✅ Loaded {len(df)} candles ({df.index[0]} → {df.index[-1]})")
+
+    bt = Backtest(df, EMACrossover, cash=args.cash, commission=0.001)
+    stats = bt.run()
+    print(stats)
+
+    # Save interactive HTML report
+    report_path = f"backtest_{args.symbol.replace('/', '')}_{args.timeframe}.html"
+    bt.plot(filename=report_path, open_browser=False)
+    print(f"📊 Report saved to {report_path}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### Running the Backtest
+
+```bash
+# Default: BTC/USDT, 1h timeframe, $50 starting capital
+python backtests/run_backtest.py
+
+# Custom symbol and timeframe
+python backtests/run_backtest.py --symbol SOL/USDT --timeframe 5m --cash 16
+
+# Use a different database path
+python backtests/run_backtest.py --symbol ETH/USDT --timeframe 1h --db /path/to/tradingbot.db
+```
+
+## Reported Metrics
+
+The `backtesting` library outputs a `pd.Series` of performance statistics after each run. Key metrics to review:
+
+| Metric | Description |
+|---|---|
+| `Return [%]` | Total percentage return over the backtest period |
+| `Buy & Hold Return [%]` | Benchmark: return of simply holding the asset |
+| `Max. Drawdown [%]` | Largest peak-to-trough equity drop |
+| `Win Rate [%]` | Percentage of trades closed at a profit |
+| `# Trades` | Total number of completed round-trips |
+| `Sharpe Ratio` | Risk-adjusted return (higher is better) |
+| `Avg. Trade [%]` | Mean return per completed trade |
+| `Exposure Time [%]` | Percentage of time the strategy held a position |
+| `Equity Final [$]` | Ending account balance |
+| `Equity Peak [$]` | Highest balance reached during the period |
+
+The `bt.plot()` call generates an interactive **Bokeh HTML report** (using `bokeh==3.10.0`) that charts equity curves, trade entry/exit markers, and EMA indicator lines over the candle data.
+
+## Strategy Configuration Reference
+
+The live EMA periods come from `config.yaml` and are mirrored in the backtest:
+
+```yaml
+strategies:
+  active: "ema_crossover"
+  ema_crossover:
+    fast_period: 9    # EMA fast line — tracks price closely
+    slow_period: 21   # EMA slow line — defines the main trend
+    signal_type: "ema"
+```
+
+The `EMAMacroStrategy` used by `MacroTrader_BTCETH` uses **EMA 50/200** (Golden/Death Cross) and adds a volume confirmation filter and a noise-rejection band of ±0.3% — generating approximately 2–5 signals per month with a significantly lower false-positive rate than the 9/21 crossover.
+
+```python
+# tradingbot/strategies/ema_macro.py
+class EMAMacroStrategy(BaseStrategy):
+    def __init__(
+        self,
+        fast_period: int = 50,
+        slow_period: int = 200,
+        volume_filter: bool = True,
+        noise_filter_pct: float = 0.003,  # ignore crosses within ±0.3%
+    ): ...
+```
+
+To backtest the macro strategy, pass `fast_period=50` and `slow_period=200` when calling `bt.optimize()` or instantiating `EMACrossover` in the script.
+
+## Future ML Roadmap
+
+The `candles` table is intentionally preserved by all capital reset scripts (`reset_to_16usd_matrix.py`, `reset_to_50usd.py`). Every candle row is a future training sample. The project roadmap targets the following phases:
+
+<Steps>
+  <Step title="Silent Data Collection (current)">
+    The bot accumulates OHLCV candles for all configured trading pairs across multiple timeframes in every `run_cycle`. No action needed — this is happening now.
+  </Step>
+  <Step title="LSTM Model Training">
+    Once a sufficient dataset has been gathered, inject the `candles` table into an LSTM neural network to predict short-horizon price movements. Requires hardware with CUDA support (GPU).
+  </Step>
+  <Step title="Sentiment Analysis Integration">
+    Augment price predictions with an NLP model trained on financial news to anticipate macro market regime changes before they appear in the candle data.
+  </Step>
+  <Step title="Signal Replacement">
+    Replace or supplement the deterministic EMA crossover signals with probabilistic ML predictions, routing high-confidence signals to the active agents and falling back to EMA on low confidence.
+  </Step>
+</Steps>

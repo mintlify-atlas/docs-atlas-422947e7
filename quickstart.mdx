@@ -1,47 +1,204 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Trading Agent Bot Running in Minutes with Paper Mode"
+sidebarTitle: "Quickstart"
+description: "Clone the repo, configure Telegram and Binance Testnet credentials, and launch the bot in safe paper-trading mode — no real funds required to get started."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
+This guide walks you through every step needed to get Trading Agent Bot running locally from scratch. By the end you will have a live bot connected to Binance Testnet, responding to Telegram commands, and simulating trades in paper mode — all without touching real money. The entire process takes under ten minutes on any machine running Python 3.10+.
 
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+<Note>
+  **Paper trading is the default.** Both `PAPER_TRADING=true` and `EXCHANGE_TESTNET=true` are set in the example environment file. The bot will simulate all trades against a virtual wallet until you explicitly change these values. Do not switch to live trading until you have validated the strategy on testnet.
+</Note>
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+
+  <Step title="Clone the repository and create a virtual environment">
+    Start by cloning the repository and isolating the project's dependencies in a Python virtual environment.
 
     ```bash
-    npm install your-package
+    git clone https://github.com/Shifuwu123/Trading-Agent-Bot.git
+    cd Trading-Agent-Bot
+
+    python -m venv .venv
+    source .venv/bin/activate   # Windows: .venv\Scripts\activate
     ```
+
+    The project requires **Python 3.10 or later**. You can confirm your version with `python --version`.
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+
+  <Step title="Install dependencies">
+    All required packages are pinned in `requirements.txt`. Install them with a single command.
 
     ```bash
-    your-cli init
+    pip install -r requirements.txt
     ```
+
+    Key packages installed include:
+
+    | Package | Purpose |
+    |---|---|
+    | `ccxt==4.5.84` | Binance (and other exchange) connectivity |
+    | `python-telegram-bot==22.8` | Telegram bot interface |
+    | `APScheduler==3.11.3` | Background task scheduling |
+    | `SQLAlchemy==2.1.1` | Database ORM for trade persistence |
+    | `pandas==3.0.6` | Candle data processing for EMA calculations |
+    | `pydantic-settings==2.15.0` | Environment variable validation |
+    | `uvloop==0.22.1` | High-performance async event loop |
+    | `loguru==0.7.3` | Structured logging to CSV and console |
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+
+  <Step title="Create your .env file">
+    Copy the provided template and fill in your credentials. The `.env` file is **never committed** — it is listed in `.gitignore` by default.
 
     ```bash
-    your-cli start
+    cp .env.example .env
     ```
+
+    Then open `.env` and replace each placeholder with your real values:
+
+    ```ini
+    # --- Exchange (CCXT) ---
+    EXCHANGE_ID=binance
+    EXCHANGE_API_KEY=tu_exchange_api_key_aqui
+    EXCHANGE_API_SECRET=tu_exchange_api_secret_aqui
+    EXCHANGE_TESTNET=true
+
+    # --- Notificaciones y Control Vía Telegram ---
+    # Token provisto por @BotFather en Telegram
+    TELEGRAM_BOT_TOKEN=tu_telegram_bot_token_aqui
+    # Chat ID numérico del usuario autorizado (obtenible vía @userinfobot en Telegram)
+    TELEGRAM_CHAT_ID=tu_telegram_chat_id_aqui
+
+    # --- Notificaciones por Correo Electrónico (Opcional) ---
+    SMTP_HOST=smtp.gmail.com
+    SMTP_PORT=587
+    SMTP_USER=tu_correo@gmail.com
+    SMTP_PASSWORD=tu_contraseña_de_aplicacion
+    EMAIL_RECIPIENT=tu_correo_destino@gmail.com
+
+    # --- Persistencia y Base de Datos ---
+    DATABASE_URL=sqlite:///tradingbot.db
+
+    # --- Configuración General del Entorno ---
+    ENVIRONMENT=development
+    LOG_LEVEL=INFO
+    PAPER_TRADING=true
+    ```
+
+    You need three values before the bot can start:
+
+    - **`TELEGRAM_BOT_TOKEN`** — Create a new bot via [@BotFather](https://t.me/BotFather) on Telegram. Send `/newbot`, follow the prompts, and copy the token it returns.
+    - **`TELEGRAM_CHAT_ID`** — Message [@userinfobot](https://t.me/userinfobot) on Telegram; it will reply with your numeric Chat ID.
+    - **`EXCHANGE_API_KEY` / `EXCHANGE_API_SECRET`** — Log in to [Binance Testnet](https://testnet.binance.vision/), generate an API key pair, and paste both values here. Because `EXCHANGE_TESTNET=true`, these testnet keys are used exclusively — your real Binance account is never touched.
+
+    <Warning>
+      **Never commit your `.env` file.** It contains your Telegram token, Binance API secrets, and optionally email credentials. Verify that `.env` appears in your `.gitignore` before making any commits. Exposure of these values could allow an attacker to control your Telegram bot or, if you later add live exchange keys, execute trades on your behalf.
+    </Warning>
   </Step>
+
+  <Step title="Review config.yaml">
+    `config.yaml` is fully commented and controls bot behaviour, trading pairs, risk limits, and scheduling. Open it and confirm the key settings before launch.
+
+    ```yaml
+    bot:
+      name: "TradingBot"
+      mode: "passive"           # 'passive' = data collection only, 'active' = trades, 'both' = both
+      trading_mode: "scalper"   # 'trend', 'target', or 'scalper'
+
+      trading_pairs:
+        - "BTC/USDT"
+        - "ETH/USDT"
+        - "SOL/USDT"
+        - "AVAX/USDT"
+        - "XRP/USDT"
+        - "DOGE/USDT"
+        - "ADA/USDT"
+        - "LINK/USDT"
+        - "DOT/USDT"
+        - "BNB/USDT"
+
+      timeframe: "1m"
+
+      dynamic_timeframe:
+        enabled: true
+        active_hours_utc:
+          start: 13
+          end: 17
+        active_timeframe: "1m"
+        passive_timeframe: "5m"
+    ```
+
+    For your first run, the defaults are safe. The most important settings to be aware of are:
+
+    - **`bot.mode`** — Set to `"passive"` to collect data without trading, `"active"` to enable live (or paper) trading, or `"both"` for simultaneous collection and trading.
+    - **`bot.trading_mode`** — Controls position-exit behaviour. `"trend"` cuts losses quickly; `"target"` holds until take-profit; `"scalper"` is optimised for short-duration high-frequency cycles.
+    - **`bot.trading_pairs`** — The list of CCXT-format symbol pairs the bot will monitor and trade. Remove any pairs you do not want to track.
+    - **`bot.timeframe`** — Base candle interval. Overridden automatically by `dynamic_timeframe` when that feature is enabled.
+
+    See the [Configuration](/configuration) page for the complete reference of every key.
+  </Step>
+
+  <Step title="Launch the bot">
+    With the virtual environment active and `.env` populated, start the bot:
+
+    ```bash
+    python main.py
+    ```
+
+    The entry point initialises the `OrchestratorBot`, starts all sub-agent scheduler threads in the background, and then hands control to `TelegramListener` which blocks the main thread and begins polling Telegram for commands.
+
+    ```
+    INFO  | Initializing Multi-Agent TradingBot Application...
+    INFO  | OrchestratorBot started. Sub-agent schedulers running.
+    INFO  | TelegramListener polling for updates...
+    ```
+
+    You can also start the bot in a detached `tmux` session using the provided launcher script, which is useful on headless servers:
+
+    ```bash
+    bash start_bot.sh
+    ```
+
+    The launcher presents a menu asking whether to run the bot in a visible terminal or silently in the background via `tmux`. If the bot is already running in a `tmux` session named `tradingbot`, the script will detect this and offer to attach to that session instead of starting a second instance.
+
+    <Tip>
+      To run as a background service without a GUI desktop environment (e.g. on a VPS), start the bot directly with `tmux new-session -d -s tradingbot "source .venv/bin/activate && python main.py"` and detach with `Ctrl+B, D`. Reattach any time with `tmux attach -t tradingbot`.
+    </Tip>
+  </Step>
+
+  <Step title="Send /start in Telegram">
+    Open Telegram and start a conversation with the bot you created in Step 3. Send the following command:
+
+    ```
+    /start
+    ```
+
+    The bot will respond with a welcome message confirming it is online and listing the available commands. From this point you can interact with the bot entirely from Telegram — no terminal access needed.
+
+    A few useful commands to verify everything is working:
+
+    ```
+    /status       — Show current bot mode, open positions, and portfolio summary
+    /cashflow     — Display income, expenses, and net P&L for the virtual wallet
+    /deposit 100  — Add $100 USDT to the paper-trading virtual wallet
+    ```
+
+    <Note>
+      Only the Telegram user whose numeric Chat ID matches `TELEGRAM_CHAT_ID` in `.env` can send commands to the bot. All messages from other users are silently ignored, keeping your bot private.
+    </Note>
+  </Step>
+
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## What Happens Next
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
-</Tip>
+Once the bot is running and responding to Telegram commands, it begins its `run_cycle` loop immediately. Every 60 seconds the orchestrator wakes each sub-agent, which fetches OHLCV candles for all configured pairs, evaluates the EMA crossover strategy, and checks Risk Manager rules before placing any paper trade. You will see cycle log messages streaming to the console (or to `~/.log/` if `BASE_LOG_DIR` is set).
+
+<CardGroup cols={2}>
+  <Card title="Configuration Reference" icon="sliders" href="/configuration">
+    Understand every `config.yaml` key and environment variable available to tune the bot's behaviour.
+  </Card>
+  <Card title="Telegram Commands" icon="paper-plane" href="/telegram/commands">
+    Full reference for all commands the bot accepts, including trading, cash flow, and reporting commands.
+  </Card>
+</CardGroup>

@@ -1,0 +1,303 @@
+---
+title: "Control Individual Sub-Agents via Telegram"
+sidebarTitle: "Agent Control"
+description: "View, pause, resume, and inspect each of the four sub-agents from Telegram, including inline keyboard navigation and automatic capital rebalancing."
+---
+
+The Trading Agent Bot runs four specialised sub-agents in parallel, each with its own capital pool, trading pairs, and EMA strategy. Every agent can be monitored and controlled independently from Telegram without touching the others. Status panels are interactive — buttons let you drill from the global overview directly into a single agent's detail view, then back again, entirely within one Telegram message thread. This page documents every per-agent command, what the detail message shows, and how capital rebalancing works when you activate or suspend the SpeculativeAgent (Tier 3).
+
+---
+
+## Agent IDs and Their Commands
+
+Each sub-agent has a canonical ID used internally by the orchestrator and surfaced in every command alias:
+
+| Icon | Agent Name | Canonical ID | Capital (default) | Pairs |
+|---|---|---|---|---|
+| ⚡ | ScalperAgent | `scalper_t1` | 50% | SOL, BNB, XRP, SUI, NEAR, DOGE, ADA |
+| 🚀 | MomentumAgent | `momentum_t2` | 40% | FET, TAO, WLD, STRK, QNT |
+| 🐋 | MacroTraderAgent | `macro_btceth` | 10% | BTC, ETH |
+| ⚠️ | SpeculativeAgent | `speculative_t3` | 0% passive | BEAMX, MUBARAK |
+
+---
+
+## Status Commands
+
+### Global Status
+
+`/status` opens the main panel. It shows the bot state, total equity, open positions count, and a compact summary row per agent. At the bottom of that message, four inline buttons let you jump directly to any agent's detail screen:
+
+```
+⚡ Scalper T1        🚀 Momentum T2
+🐋 Macro BTC/ETH    ⚠️ Especulativo T3
+```
+
+### Per-Agent Status Commands
+
+<Tabs>
+  <Tab title="ScalperAgent">
+    ```
+    /status_scalper
+    /status_scalper_t1
+    ```
+    Both aliases resolve to agent ID `scalper_t1`. Shows the ScalperAgent's mode, strategy timeframe, assigned capital, cycle count, all open SOL/BNB/XRP/SUI/NEAR/DOGE/ADA positions, and the per-coin wallet breakdown.
+  </Tab>
+  <Tab title="MomentumAgent">
+    ```
+    /status_momentum
+    /status_momentum_t2
+    ```
+    Both aliases resolve to `momentum_t2`. Shows the MomentumAgent's FET/TAO/WLD/STRK/QNT coverage.
+  </Tab>
+  <Tab title="MacroTraderAgent">
+    ```
+    /status_macro
+    /status_macro_btceth
+    ```
+    Both aliases resolve to `macro_btceth`. Reports BTC and ETH positions under the EMA 50/200 macro strategy.
+  </Tab>
+  <Tab title="SpeculativeAgent">
+    ```
+    /status_speculative
+    /status_speculative_t3
+    ```
+    Both aliases resolve to `speculative_t3`. When the agent is in PASSIVE mode this panel shows `⚪ Inactivo (Activar con /resume_speculative)` for the operating field.
+  </Tab>
+</Tabs>
+
+---
+
+## What the Agent Detail Message Shows
+
+When you open an agent detail view — via command or inline button — the orchestrator calls `format_agent_detail_message(agent_id)` and returns a structured message. Here is what each section contains:
+
+<Tabs>
+  <Tab title="ACTIVE agent">
+    ```
+    ⚡ Detalle del Sub-Agente: ScalperAgent T1
+
+    • Estado: 🟢 ACTIVO
+    • Estrategia: TREND
+    • Timeframe: 5m
+    • Capital Asignado: $25.00 USDT (50% del total)
+    • Ciclos Ejecutados: 142
+
+    📋 Pares Asignados:
+      • SOL/USDT: $148.80
+      • BNB/USDT: $312.40
+      • XRP/USDT: $0.5821
+      • SUI/USDT: $1.0430
+      • NEAR/USDT: $4.2100
+      • DOGE/USDT: $0.1320
+      • ADA/USDT: $0.4510
+
+    📂 Posiciones Abiertas (1):
+      • 🟢 SOL/USDT (BUY): 0.0500
+        Entrada: $145.20 | Actual: $148.80
+        PnL Flotante: +$0.18 USD (+2.48%)
+
+    💰 Rendimiento y PnL:
+      • PnL Total Neto: +$0.25 USD
+      • Ganancias Realizadas: +$0.07 USD (3 trades)
+      • Ganancias Flotantes: +$0.18 USD
+      • Win Rate: 66.7% (2 ganados / 1 perdido)
+
+    📊 Evaluaciones de Mercado:
+      • Total Evaluaciones: 1,024
+        └ HOLD: 980
+        └ BUY: 30
+        └ SELL: 14
+
+    👝 Billetera por Moneda ($1.00 USD Base / Par):
+      • 🟢 [POS] SOL/USDT: $1.18 USD (Base: $1.00 | PnL: +$0.18)
+      • ⚪ [LIQ] BNB/USDT: $1.02 USD (Base: $1.00 | PnL: +$0.02)
+    ```
+
+    The agent detail keyboard shows: 🔄 Actualizar, ⏸️ Pausar Agente, and ⬅️ Volver a Estado Global.
+  </Tab>
+  <Tab title="PASSIVE agent">
+    ```
+    ⚠️ Detalle del Sub-Agente: SpeculativeAgent T3
+
+    • Estado: ⏸️ PASSIVE
+    • Estrategia: TREND
+    • Timeframe: 15m
+    • Capital Asignado: $0.00 USDT (0% del total)
+    • Ciclos Ejecutados: 0
+
+    📋 Pares Asignados:
+      • BEAMX/USDT: N/A
+      • MUBARAK/USDT: N/A
+
+    📂 Posiciones Abiertas (0):
+      Ninguna. El agente está en liquidez 100% USDT.
+
+    💰 Rendimiento y PnL:
+      • PnL Total Neto: $0.00 USD
+      • Ganancias Realizadas: $0.00 USD (0 trades)
+      • Ganancias Flotantes: $0.00 USD
+      • Win Rate: 0.0% (0 ganados / 0 perdidos)
+
+    📊 Evaluaciones de Mercado:
+      • Total Evaluaciones: 0
+    ```
+
+    The agent detail keyboard shows: 🔄 Actualizar, ▶️ Reanudar Agente, and ⬅️ Volver a Estado Global.
+  </Tab>
+</Tabs>
+
+---
+
+## Pause and Resume Individual Agents
+
+Every sub-agent can be paused and resumed independently. Pausing an agent sets its internal `paused` flag; the agent's background thread keeps running (the scheduler stays alive) but trading evaluations are skipped on every cycle.
+
+### Command syntax
+
+```
+# Full IDs
+/pause_scalper_t1
+/pause_momentum_t2
+/pause_macro_btceth
+/pause_speculative_t3
+
+/resume_scalper_t1
+/resume_momentum_t2
+/resume_macro_btceth
+/resume_speculative_t3
+```
+
+Short aliases also work via `/pause <alias>` and `/resume <alias>`:
+
+```
+/pause scalper
+/pause momentum
+/pause macro
+/pause speculative
+
+/resume scalper
+/resume momentum
+/resume macro
+/resume speculative
+```
+
+### Pause reply example
+
+```
+⏸️ Agente ScalperAgent T1 (scalper_t1) pausado con éxito.
+
+• Modo en que quedó: PASSIVE (⏸️ PASSIVE)
+• Estrategia: TREND (5m)
+
+Las operaciones de este sub-agente quedan suspendidas.
+Para reactivar: /resume_scalper_t1
+```
+
+### Resume reply example
+
+```
+▶️ Agente MomentumAgent T2 (momentum_t2) reanudado con éxito.
+
+• Modo en que quedó: ACTIVE (🟢 ACTIVO)
+• Estrategia: TREND (15m)
+• Capital Asignado: $20.00 USDT (40% del total)
+
+El ciclo de trading evaluará oportunidades en el
+siguiente cierre de vela (15m).
+```
+
+---
+
+## Capital Rebalancing: Scenario A vs Scenario B
+
+The orchestrator uses two capital distribution scenarios. Which scenario is active depends solely on whether `speculative_t3` is running in ACTIVE mode.
+
+<CardGroup cols={2}>
+  <Card title="Scenario B — Default" icon="pause">
+    SpeculativeAgent is PASSIVE (0% capital). The three active agents split the entire pool:
+
+    - ScalperAgent T1 → **50%**
+    - MomentumAgent T2 → **40%**
+    - MacroTraderAgent → **10%**
+    - SpeculativeAgent → **$0.00**
+  </Card>
+  <Card title="Scenario A — T3 Active" icon="play">
+    SpeculativeAgent is ACTIVE. Capital is redistributed across all four agents:
+
+    - ScalperAgent T1 → **45%**
+    - MomentumAgent T2 → **35%**
+    - MacroTraderAgent → **10%**
+    - SpeculativeAgent T3 → **10%**
+  </Card>
+</CardGroup>
+
+Rebalancing is triggered automatically inside `resume_agent()` and `pause_agent()` in the orchestrator whenever the target is `speculative_t3`:
+
+```python
+# From tradingbot/core/orchestrator.py
+async def resume_agent(self, agent_id: str) -> dict:
+    self.agents[agent_id].resume()
+    if agent_id == "speculative_t3":
+        total = await self._fetch_total_capital()
+        self._assign_capital(total, scenario_a=True)   # → Scenario A
+    return self.agents[agent_id].get_status()
+
+async def pause_agent(self, agent_id: str) -> dict:
+    self.agents[agent_id].pause()
+    if agent_id == "speculative_t3":
+        total = await self._fetch_total_capital()
+        self._assign_capital(total, scenario_a=False)  # → Scenario B
+    return self.agents[agent_id].get_status()
+```
+
+---
+
+## Activating the SpeculativeAgent (T3) from Passive Mode
+
+The SpeculativeAgent starts in PASSIVE mode with zero capital assigned. The following steps show how to bring it online from your Telegram chat.
+
+<Steps>
+  <Step title="Check current state">
+    Send `/status_speculative` or tap **⚠️ Especulativo T3** in the `/status` panel. Confirm the status shows `⏸️ PASSIVE` and `Capital Asignado: $0.00 USDT`.
+  </Step>
+  <Step title="Resume the agent">
+    Send `/resume_speculative` (or `/resume_speculative_t3`). The orchestrator calls `resume_agent("speculative_t3")`, sets the agent to ACTIVE, fetches the current total equity, and redistributes capital using **Scenario A** (45/35/10/10%).
+  </Step>
+  <Step title="Verify capital rebalancing">
+    The reply message confirms the new capital allocation:
+    ```
+    ▶️ Agente SpeculativeAgent T3 (speculative_t3) reanudado con éxito.
+    • Capital Asignado: $5.00 USDT (10% del total)
+    ```
+    Check `/status` to confirm all four agents now show their new Scenario A allocations.
+  </Step>
+  <Step title="Confirm trading evaluations begin">
+    Send `/status_speculative` again after one candle close (15 m timeframe). Total evaluations should increment from 0 and open positions may appear once a BUY signal fires.
+  </Step>
+  <Step title="Return to passive mode if needed">
+    Send `/pause_speculative` at any time. Capital is redistributed back to **Scenario B** immediately, and the T3 agent stops evaluating opportunities without losing any historical data.
+  </Step>
+</Steps>
+
+---
+
+## Inline Keyboard Navigation Flow
+
+The inline keyboards form a connected navigation graph. You never need to type a command after the initial `/status` — all transitions are button-driven:
+
+```
+/status  ──► agent_view:scalper_t1  ──► ⏸️ Pausar Agente
+                                    ──► 🔄 Actualizar
+                                    ──► ⬅️ Volver a Estado Global
+         ──► nav:cashflow
+         ──► nav:wallet
+         ──► nav:matrix
+         ──► stats_h:0 / stats_h:6 / stats_h:24
+         ──► nav:why_block
+         ──► nav:modes  ──► set_mode:trend / target / scalper
+         ──► cmd:pause / cmd:resume
+```
+
+<Tip>
+Tap **🔄 Actualizar** on any panel to refresh the data in-place without sending a new message. This keeps your chat history clean and avoids message spam during busy trading periods.
+</Tip>

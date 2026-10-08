@@ -1,0 +1,353 @@
+---
+title: "Wallet, Cash Flow, and Financial Reporting in Telegram"
+sidebarTitle: "Cash Flow & Wallet"
+description: "Guide to the paper-trading wallet, cash-flow records, asset monetisation, the asset matrix ON/OFF table, and decision-statistics panel via Telegram."
+---
+
+Trading Agent Bot maintains a complete paper-trading financial ledger inside a SQLite database. Every buy, sell, deposit, expense, and profit harvest is persisted and immediately queryable from Telegram. The `PortfolioManager` class owns all reads and writes — it exposes both synchronous and async interfaces so the data remains consistent across the four parallel agent threads. This page explains what each financial command shows, what the underlying data model looks like, and how to interpret every piece of output.
+
+---
+
+## Digital Wallet
+
+The wallet is backed by a `DigitalWallet` database row keyed to your `TELEGRAM_CHAT_ID`. It holds a single `balance_usd` decimal that represents liquid USDT — cash not deployed in any open position.
+
+```python
+# From tradingbot/database/models.py (via portfolio_manager.py)
+wallet = DigitalWallet(
+    telegram_id=telegram_id,
+    balance_usd=Decimal("50.0"),   # initial balance
+    is_paper=True
+)
+```
+
+The initial balance is **$50.00 USD**. Every trade buy deducts `amount × price` from the balance; every sell or monetisation credits it back.
+
+<Accordion title="/wallet — Full wallet holdings">
+
+Displays three sections: liquid balance, active position holdings per asset, and a historical realized-P&L table grouped by symbol.
+
+```
+/wallet
+/billetera
+```
+
+The response is built from two sources:
+1. `format_global_wallet_message()` (multi-agent mode) — shows per-agent coin breakdowns.
+2. `portfolio_manager.get_portfolio_summary()` — lists every `Portfolio` row where `quantity > 0`.
+
+**Example output:**
+```
+👝 Billetera Digital Multi-Agente
+
+💵 Saldo Total en Cuenta: $50.18 USDT ($47,671 CLP)
+💧 Liquidez Disponible: $9.42 USDT
+🎯 Inversión Base Matriz: $16.00 USD (16 pares x $1.00 USD)
+
+━━━━━━━━━━━━━━━━━━━
+🤖 Billeteras por Sub-Agente:
+
+⚡ ScalperAgent T1 (7 monedas):
+  • Base: $7.00 USD | Saldo Actual: $7.25 USD
+  • PnL Total: +$0.25 USD (Realizado: $0.07 | Flotante: $0.18)
+    └ 🟢 SOL/USDT: $1.18 (+$0.18)
+    └ ⚪ BNB/USDT: $1.02 (+$0.02)
+    └ ⚪ XRP/USDT: $1.00 ($0.00)
+    ...
+
+🚀 MomentumAgent T2 (5 monedas):
+  • Base: $5.00 USD | Saldo Actual: $5.03 USD
+  • PnL Total: +$0.03 USD (Realizado: $0.03 | Flotante: $0.00)
+```
+
+**Per-coin wallet fields (coins_breakdown):**
+
+| Field | Meaning |
+|---|---|
+| `base_investment_usd` | Always `$1.00 USD` — the fixed per-pair allocation |
+| `current_value_usd` | Live value: base + cumulative P&L |
+| `total_pnl_usd` | Realized + unrealized P&L for this coin |
+| `realized_pnl_usd` | P&L from closed trades only |
+| `unrealized_pnl_usd` | Floating P&L from open positions |
+| `has_open_position` | `true` → 🟢 [POS], `false` → ⚪ [LIQ] |
+
+</Accordion>
+
+---
+
+## Cash Flow
+
+<Accordion title="/cashflow — Full financial flow report">
+
+Generates a real-time financial report pulling from three data sources: the `CashFlow` table (deposits/expenses/withdrawals), closed `Trade` records (realized P&L), and open `Portfolio` rows (unrealized P&L).
+
+```
+/cashflow
+```
+
+**Example output:**
+```
+📊 Reporte Financiero (Flujo de Caja)
+
+💼 Inversión Inicial (Base): $50.00 USD
+📥 Depósitos Adicionales: +$20.00 USD
+💸 Gastos Operativos (APIs/VPS): -$5.00 USD
+
+📈 Ganancias Realizadas (Trades cerrados): 🟢 $0.32 USD
+📊 Ganancias Activas (Unrealized PnL): 🟢 $0.18 USD
+💰 PnL Total Neto: 🟢 $0.50 USD
+
+🏦 Capital Liquidado Disponible: $65.50 USD
+🎯 ROI Neto Total: 🚀 0.76%
+```
+
+**ROI formula (from `get_cashflow_summary()`):**
+```python
+base_capital = 50.0 + total_deposits - total_expenses
+roi_pct = (total_pnl / base_capital) * 100
+```
+
+</Accordion>
+
+<Accordion title="/deposit <amount> [note] — Add funds to the wallet">
+
+Records a `DEPOSIT` entry in the `CashFlow` table and increases `DigitalWallet.balance_usd` by the specified amount.
+
+```
+/deposit 100
+/deposit 100 Recarga de capital mensual
+```
+
+<ParamField path="amount" type="float" required>
+  Amount in USD. Must be a positive number.
+</ParamField>
+
+<ParamField path="note" type="string" optional>
+  Free-text description stored in `CashFlow.description`. Defaults to `"Depósito"`.
+</ParamField>
+
+**Reply:**
+```
+✅ Depósito registrado: +$100.00 USD
+Nota: Recarga de capital mensual
+Nuevo Balance: $150.00 USD
+```
+
+</Accordion>
+
+<Accordion title="/expense <amount> [note] — Record an operating expense">
+
+Records an `EXPENSE` entry in `CashFlow` and deducts the amount from `DigitalWallet.balance_usd`. Typical use: VPS costs, Binance API subscriptions, monitoring tools.
+
+```
+/expense 20
+/expense 20 Pago VPS DigitalOcean
+```
+
+<ParamField path="amount" type="float" required>
+  Expense amount in USD.
+</ParamField>
+
+<ParamField path="note" type="string" optional>
+  Free-text label. Defaults to `"Gasto Operativo"`.
+</ParamField>
+
+**Reply:**
+```
+💸 Gasto registrado: -$20.00 USD
+Nota: Pago VPS DigitalOcean
+Nuevo Balance: $130.00 USD
+```
+
+</Accordion>
+
+<Accordion title="/reset_pnl — Archive trades and reset ROI counter">
+
+Archives all `CLOSED` trades by setting their `status` to `ARCHIVED`, which removes them from the realized-P&L sum without deleting any data. The ROI counter resets to `0.00%` and the realized P&L column in `/cashflow` returns to `$0.00`. Active positions and the wallet balance are completely untouched.
+
+```
+/reset_pnl
+```
+
+The command first shows a confirmation keyboard:
+```
+⚠️ Reinicio de PnL y Ganancias Acumuladas
+¿Confirmas reiniciar el contador de PnL a $0.00 USD?
+
+• Se archivarán las ganancias de trades cerrados anteriores
+• Tus posiciones activas y capital se mantienen intactos
+• El ROI total neto se reiniciará a 0.00%
+
+[✅ Confirmar Reinicio PnL]  [❌ Cancelar]
+```
+
+On confirmation:
+```python
+# From tradingbot/execution/portfolio_manager.py
+for t in trades:
+    t.status = "ARCHIVED"   # preserves audit trail
+session.commit()
+```
+
+**Confirmation reply:**
+```
+✅ PnL Reiniciado Exitosamente
+Se archivaron 14 trades antiguos ($0.32 USD).
+```
+
+</Accordion>
+
+---
+
+## Monetisation
+
+<Accordion title="/monetizar / /monetize_asset — Liquidate an asset to USDT">
+
+Closes every open position for the specified asset, calculates the net P&L, credits the full USDT value to the `DigitalWallet`, and marks all related trades as `CLOSED`. If no open trade records exist (the asset was accumulated outside the normal buy flow), a synthetic `ProfitHarvesting` trade is created for auditing.
+
+```
+/monetizar SOL
+/monetizar SOL 155.00
+/monetize_asset DOGE
+```
+
+<ParamField path="asset" type="string" required>
+  Base asset symbol. Slashes are stripped: `SOL/USDT` and `SOL` both work.
+</ParamField>
+
+<ParamField path="price" type="float" optional>
+  Optional exit price override. When omitted, `Portfolio.current_price` is used as the exit price.
+</ParamField>
+
+**Monetisation logic (from `monetize_asset_async()`):**
+```python
+total_credited = qty * exit_px
+cost_basis     = qty * avg_px
+realized_pnl   = total_credited - cost_basis
+pnl_pct        = realized_pnl / cost_basis
+
+# Credit wallet
+wallet.balance_usd += Decimal(str(total_credited))
+
+# Zero out portfolio entry
+portfolio.quantity      = Decimal("0.0")
+portfolio.avg_price     = Decimal("0.0")
+portfolio.unrealized_pnl = Decimal("0.0")
+```
+
+**Example reply:**
+```
+💰 MONETIZACIÓN EXITOSA: SOL
+
+🎉 Se liquidó la posición y acreditó a tu billetera:
+• Cantidad: 0.5000 SOL
+• Precio Ejecución: $155.0000 USDT
+• Total Acreditado: 🟢 +$77.50 USD
+• Ganancia Neta (PnL): +$5.25 USD (+7.3%)
+• Nuevo Saldo Líquido: $84.92 USDT
+```
+
+<Note>
+Monetisation is irreversible within the current session. The asset's portfolio entry is set to zero immediately. If you need to re-enter the position, use `/buy` to open a new trade manually.
+</Note>
+
+</Accordion>
+
+---
+
+## Asset Matrix
+
+<Accordion title="/matriz / /activos — Economic and operational tables">
+
+Renders two distinct tables built from `format_matrix_message()` on the orchestrator.
+
+```
+/matriz
+/activos
+/matrix
+```
+
+**Table 1 — Economic Table:** Every tracked coin's current USD balance and cumulative P&L:
+```
+📊 MATRIZ DE ACTIVOS Y FUNCIONAMIENTO
+
+━━━━━━━━━━━━━━━━━━━
+💰 TABLA ECONÓMICA (Saldos por Moneda / Base $1.00 USD):
+
+  • SOL/USDT (scalper_t1):  $1.18 USD  (PnL: +$0.18)
+  • BNB/USDT (scalper_t1):  $1.02 USD  (PnL: +$0.02)
+  • XRP/USDT (scalper_t1):  $1.00 USD  (PnL: $0.00)
+  • FET/USDT (momentum_t2): $0.97 USD  (PnL: -$0.03)
+  • BTC/USDT (macro_btceth): $1.05 USD (PnL: +$0.05)
+  ...
+```
+
+**Table 2 — Operational Table (ON/OFF):**
+```
+⚙️ TABLA DE FUNCIONAMIENTO (Estados ON / OFF):
+
+  • SOL/USDT [scalper_t1]:   🟢 ON (Operando)
+  • FET/USDT [momentum_t2]:  ⏸️ OFF (Pausado)
+  • BEAMX/USDT [speculative_t3]: 🔴 OFF (Detenida/Sin Fondos)
+  ...
+
+📈 Resumen Operativo: 11 Monedas en 🟢 ON | 5 Monedas en 🔴 OFF
+```
+
+A coin is ON when: its `current_value_usd > 0` **and** its parent agent's mode is `ACTIVE`. It drops to OFF if its balance hits `$0.00` or the agent is paused.
+
+</Accordion>
+
+---
+
+## Decision Statistics
+
+<Accordion title="/stats [hours] — Today's or rolling decision counts">
+
+Queries the `DecisionLog` table for all decisions logged by the agents. The default window is **today in Chile time** — the UTC range is calculated dynamically from `get_chile_day_range_in_utc()` so the "today" boundary always matches Santiago midnight, not UTC midnight.
+
+```
+/stats          # today (Chile time)
+/stats 6        # last 6 hours
+/stats 24       # last 24 hours
+```
+
+**Example output — today:**
+```
+📊 Estadísticas: Hoy (Hora Chile)
+
+• Total Evaluaciones: 4,832
+• ⏸️ HOLD (Esperando): 4,710
+• 🛡️ Operaciones Bloqueadas: 87
+• 🟢 Compras (BUY): 26
+• 🔴 Ventas (SELL): 9
+```
+
+**Example output — last 6 hours:**
+```
+📊 Estadísticas: Últimas 6 hora(s)
+
+• Total Evaluaciones: 1,204
+• ⏸️ HOLD (Esperando): 1,172
+• 🛡️ Operaciones Bloqueadas: 19
+• 🟢 Compras (BUY): 9
+• 🔴 Ventas (SELL): 4
+```
+
+An `❌ Errores` line appears only when the error count is greater than zero.
+
+**Inline filter buttons on the stats message:**
+
+| Button | Filter |
+|---|---|
+| 📅 Hoy ✅ | Current Chile day (00:00–23:59 Santiago) |
+| ⏱️ 6h | Last 6 hours (rolling) |
+| ⏱️ 24h | Last 24 hours (rolling) |
+| 🔄 Actualizar | Re-query with the currently active filter |
+| 🛡️ Ver Bloqueos | Navigate to the `/why_block` panel |
+
+<Tip>
+A high BLOCKED-to-BUY ratio is normal and healthy — it means the risk manager is working. If you see zero BUY decisions over 24 hours alongside many HOLDs, check `/why_block` to understand which rule is triggering most often.
+</Tip>
+
+</Accordion>

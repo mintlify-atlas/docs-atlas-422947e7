@@ -1,0 +1,281 @@
+---
+title: "EMA Crossover Strategy: Signal Generation and Logic"
+sidebarTitle: "EMA Crossover"
+description: "Deep dive into the two EMA strategies powering Trading Agent Bot — how crossover signals are generated, validated against closed candles, and dispatched as BUY, SELL, or HOLD."
+---
+
+Trading Agent Bot ships two Exponential Moving Average strategies. The primary `EMACrossoverStrategy` (fast=9 / slow=21) drives most agents with high-frequency signals optimised for volatile altcoin markets. The `EMAMacroStrategy` (EMA 50/200) is reserved exclusively for the `MacroTraderAgent` (BTC/ETH), trading institutional Golden/Death Crosses on 15-minute candles with a volume filter and a noise-zone guard. Both strategies implement the same abstract `BaseStrategy` interface, so they are fully interchangeable through the `strategies.active` key in any agent config file.
+
+## BaseStrategy Interface
+
+Every strategy in the bot extends `BaseStrategy`, a lightweight Python ABC that enforces a single contract: `generate_signal` receives a pandas `DataFrame` of OHLCV data and **must** return one of three string constants — `"BUY"`, `"SELL"`, or `"HOLD"`.
+
+```python
+from abc import ABC, abstractmethod
+import pandas as pd
+from tradingbot.utils.logger import log
+
+class BaseStrategy(ABC):
+    """
+    Abstract base class for all trading strategies.
+    """
+
+    @abstractmethod
+    def generate_signal(self, df: pd.DataFrame) -> str:
+        """
+        Analyzes a DataFrame of market data and returns a trading signal.
+
+        Args:
+            df (pd.DataFrame): Market data containing OHLCV and potential indicators.
+
+        Returns:
+            str: "BUY", "SELL", or "HOLD".
+        """
+        pass
+```
+
+<Note>
+  All strategies operate exclusively on **closed candles**. The bot's `run_cycle()` skips execution when the current minute is not a multiple of the selected timeframe, preventing signal repainting on the live (incomplete) candle.
+</Note>
+
+## Signal Return Values
+
+| Value | Meaning |
+|-------|---------|
+| `"BUY"` | Fast EMA crossed **above** slow EMA (bullish momentum) — open a long position |
+| `"SELL"` | Fast EMA crossed **below** slow EMA (bearish reversal) — close existing longs |
+| `"HOLD"` | No crossover detected, insufficient data, or filters blocked the signal |
+
+---
+
+## EMACrossoverStrategy
+
+`EMACrossoverStrategy` is the default strategy loaded by `TradingBot` and used by the Scalper, Momentum, and Speculative agents. It compares two consecutive candles to detect the exact bar where the fast EMA transitions from below to above the slow EMA (BUY) or from above to below (SELL).
+
+### How It Works
+
+The strategy computes both EMAs using pandas `ewm` (exponentially weighted mean) on the `close` column, then reads the last two values (`curr`, `prev`) to check for a crossover — not a mere crossing of levels, but a **directional transition** between bars. This means a signal fires only once per crossover event, not on every bar while the fast EMA remains above the slow.
+
+```python
+import pandas as pd
+from tradingbot.strategies.base_strategy import BaseStrategy
+from tradingbot.utils.logger import log
+
+class EMACrossoverStrategy(BaseStrategy):
+    """
+    EMA Crossover Strategy:
+    - Generates a BUY signal when the fast EMA crosses above the slow EMA.
+    - Generates a SELL signal when the fast EMA crosses below the slow EMA.
+    - Returns HOLD otherwise.
+    """
+    def __init__(self, fast_period: int = 9, slow_period: int = 21):
+        self.fast_period = fast_period
+        self.slow_period = slow_period
+        log.info(f"Initialized EMACrossoverStrategy with fast={fast_period}, slow={slow_period}")
+
+    def generate_signal(self, df: pd.DataFrame) -> str:
+        """
+        Analyzes a DataFrame of market data and returns a trading signal
+        based on EMA crossovers.
+        """
+        if df is None or df.empty:
+            log.warning("Empty or None DataFrame passed to generate_signal.")
+            return "HOLD"
+
+        if len(df) < self.slow_period + 1:
+            log.warning(
+                f"Not enough data to calculate EMAs for {self.slow_period} periods. "
+                f"Need at least {self.slow_period + 1} rows."
+            )
+            return "HOLD"
+
+        close_col = 'close' if 'close' in df.columns else 'Close'
+        if close_col not in df.columns:
+            log.error(f"Close column not found in dataframe. Available columns: {list(df.columns)}")
+            return "HOLD"
+
+        # Calculate EMAs using pandas ewm natively
+        fast_ema = df[close_col].ewm(span=self.fast_period, adjust=False).mean()
+        slow_ema = df[close_col].ewm(span=self.slow_period, adjust=False).mean()
+
+        # Get last two rows for crossover check
+        curr_fast = fast_ema.iloc[-1]
+        curr_slow = slow_ema.iloc[-1]
+        prev_fast = fast_ema.iloc[-2]
+        prev_slow = slow_ema.iloc[-2]
+
+        if pd.isna(curr_fast) or pd.isna(curr_slow) or pd.isna(prev_fast) or pd.isna(prev_slow):
+            return "HOLD"
+
+        if curr_fast > curr_slow and prev_fast <= prev_slow:
+            log.info(f"BUY signal: fast EMA ({curr_fast:.2f}) crossed above slow EMA ({curr_slow:.2f})")
+            return "BUY"
+        elif curr_fast < curr_slow and prev_fast >= prev_slow:
+            log.info(f"SELL signal: fast EMA ({curr_fast:.2f}) crossed below slow EMA ({curr_slow:.2f})")
+            return "SELL"
+        else:
+            return "HOLD"
+```
+
+### Anti-Repainting Guard
+
+The bot explicitly skips any trading cycle where the current candle has not yet closed. This logic lives in `TradingBot.run_cycle()`:
+
+```python
+# Anti-Repainting Protection
+if current_tf.endswith('m'):
+    tf_mins = int(current_tf.replace('m', ''))
+    current_min = datetime.utcnow().minute
+    if tf_mins > 1 and current_min % tf_mins != 0:
+        log.info(
+            f"Timeframe {current_tf} selected. Minute {current_min} is not a multiple. "
+            f"Skipping cycle to avoid repainting."
+        )
+        decisions = [
+            {'symbol': s, 'decision': 'HOLD', 'reason': f"Waiting for {current_tf} candle to close"}
+            for s in self.config.bot.trading_pairs
+        ]
+        self.portfolio_manager.record_decisions_bulk(decisions)
+        return
+```
+
+<Tip>
+  On a `5m` timeframe the bot only processes signals at minutes 0, 5, 10, 15 … etc. All other minutes are automatically skipped with a `HOLD` recorded in the database.
+</Tip>
+
+---
+
+## EMAMacroStrategy
+
+`EMAMacroStrategy` replaces the standard crossover with a **Golden Cross / Death Cross** pattern used by institutional traders. It is designed for BTC/USDT and ETH/USDT on 15-minute candles where the tight daily price range (~1%) makes the faster EMA 9/21 produce too many false positives (~70% false-signal rate vs ~20–25% for EMA 50/200).
+
+Two additional filters eliminate low-quality signals:
+
+- **Noise zone filter** — ignores crossovers where the gap between EMA50 and EMA200 is less than 0.3% of the current price, filtering out micro-oscillations that do not represent a true trend change.
+- **Volume filter** — confirms the signal only if the current candle's volume exceeds the 20-candle rolling average, rejecting crosses that occur in thin, illiquid markets.
+
+```python
+class EMAMacroStrategy(BaseStrategy):
+    def __init__(
+        self,
+        fast_period: int = 50,
+        slow_period: int = 200,
+        volume_filter: bool = True,
+        noise_filter_pct: float = 0.003,  # Ignores crosses within ±0.3%
+    ):
+        self.fast_period = fast_period
+        self.slow_period = slow_period
+        self.volume_filter = volume_filter
+        self.noise_filter_pct = noise_filter_pct
+
+    def generate_signal(self, df: pd.DataFrame) -> str:
+        # ... (validation guards) ...
+
+        fast_ema = df[close_col].ewm(span=self.fast_period, adjust=False).mean()
+        slow_ema = df[close_col].ewm(span=self.slow_period, adjust=False).mean()
+
+        curr_fast, curr_slow = fast_ema.iloc[-1], slow_ema.iloc[-1]
+        prev_fast, prev_slow = fast_ema.iloc[-2], slow_ema.iloc[-2]
+
+        # --- Noise zone filter ---
+        current_price = float(df[close_col].iloc[-1])
+        ema_gap_pct = abs(curr_fast - curr_slow) / current_price
+        if ema_gap_pct < self.noise_filter_pct:
+            return "HOLD"
+
+        # --- Volume filter ---
+        volume_confirms = True
+        if self.volume_filter and "volume" in df.columns:
+            vol_avg = df["volume"].rolling(20).mean().iloc[-1]
+            current_vol = df["volume"].iloc[-1]
+            volume_confirms = current_vol > vol_avg
+
+        # --- Golden Cross (BUY): EMA50 crosses above EMA200 ---
+        if curr_fast > curr_slow and prev_fast <= prev_slow and volume_confirms:
+            return "BUY"
+
+        # --- Death Cross (SELL): EMA50 crosses below EMA200 ---
+        elif curr_fast < curr_slow and prev_fast >= prev_slow and volume_confirms:
+            return "SELL"
+
+        return "HOLD"
+```
+
+<Warning>
+  `EMAMacroStrategy` requires at least **201 candles** of history (`slow_period + 1`). On the 15-minute timeframe that is ~50 hours of data. The `DataCollector` automatically requests `max(50, slow_period + 50)` candles per call so this minimum is always satisfied.
+</Warning>
+
+---
+
+## Configuration
+
+<Tabs>
+  <Tab title="EMACrossoverStrategy (default)">
+    The primary strategy used by Scalper, Momentum, and Speculative agents. Configured under `strategies.ema_crossover` in `config.yaml`:
+
+    ```yaml
+    strategies:
+      # Active strategy loaded at runtime
+      active: "ema_crossover"
+
+      ema_crossover:
+        # Number of candles for the fast line — tracks price closely
+        fast_period: 9
+        # Number of candles for the slow line — marks the main trend
+        slow_period: 21
+        # Indicator type
+        signal_type: "ema"
+    ```
+
+    The bot instantiates the strategy with these periods at startup:
+
+    ```python
+    self.strategy = EMACrossoverStrategy(
+        fast_period=config.strategies.ema_crossover.fast_period,  # 9
+        slow_period=config.strategies.ema_crossover.slow_period,  # 21
+    )
+    ```
+  </Tab>
+
+  <Tab title="EMAMacroStrategy (MacroTrader)">
+    Used exclusively by the `MacroTraderAgent` (BTC/ETH). Configured in `configs/agent_macro.yaml`:
+
+    ```yaml
+    strategies:
+      active: "ema_macro"        # ← Overrides the global strategy
+      ema_macro:
+        fast_period: 50          # EMA 50 — institutional Golden Cross
+        slow_period: 200         # EMA 200 — reliable long-term signal
+        signal_type: "ema"
+        volume_filter: true      # Reject crosses without volume confirmation
+    ```
+
+    The MacroTrader also overrides timeframe and risk parameters to suit BTC/ETH's narrower daily range:
+
+    ```yaml
+    bot:
+      trading_mode: "trend"      # Cut losses fast on reversals
+      timeframe: "15m"           # Captures impulses without BTC/ETH noise
+
+    risk:
+      max_loss_per_trade_pct: 0.015   # SL 1.5% — tight daily range
+      default_take_profit_pct: 0.015  # TP 1.5% — realistic for ~1% daily range
+      trailing_stop_positive: 0.008   # Tighter trailing for slow trends
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Strategy Comparison
+
+| Feature | EMACrossoverStrategy | EMAMacroStrategy |
+|---|---|---|
+| **EMA periods** | Fast 9 / Slow 21 | Fast 50 / Slow 200 |
+| **Signal frequency** | ~40–80 / month | ~2–5 / month |
+| **False signal rate** | ~70% | ~20–25% |
+| **Volume filter** | No | Yes (20-candle avg) |
+| **Noise zone filter** | No | Yes (±0.3%) |
+| **Best for** | Altcoins, scalping | BTC/ETH macro trends |
+| **Minimum candles needed** | 22 | 201 |
+| **Agents using it** | Scalper, Momentum, Speculative | MacroTrader |

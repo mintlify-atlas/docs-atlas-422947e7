@@ -1,0 +1,147 @@
+---
+title: "Trading Agent Bot Architecture and Component Design"
+sidebarTitle: "Overview"
+description: "A layered walkthrough of every module in Trading Agent Bot — from the async OrchestratorBot root down to the SQLite persistence layer and Telegram interface."
+---
+
+Trading Agent Bot is built as a fully asynchronous, multi-agent system where a central orchestrator spawns four independent sub-agents, each running in its own thread with its own APScheduler loop, capital pool, and trading strategy. The codebase is organized into clearly separated module groups: a `core/` layer for configuration and lifecycle, an `engine/` layer for trade decision-making and risk management, a `market/` layer for exchange connectivity, an `execution/` layer for order routing and portfolio state, a `strategies/` layer for signal generation, a `database/` layer for persistence, and an `interfaces/` layer for Telegram commands and notifications. Understanding how these layers relate to each other is the foundation for customizing or extending any part of the system.
+
+## Directory Structure
+
+The project root is flat: `main.py` launches the `OrchestratorBot`, while `agents/` holds the four concrete sub-agent classes and `configs/` holds the per-agent YAML configuration files. All shared runtime code lives under `tradingbot/`.
+
+```text
+Trading-Agent-Bot/
+├── main.py                          # Entry point — starts OrchestratorBot
+├── config.yaml                      # Global bot configuration (legacy TradingBot)
+├── .env                             # Exchange API keys, Telegram token, DB URL
+│
+├── agents/                          # Concrete sub-agent implementations
+│   ├── base_agent.py                # Abstract BaseAgent with shared run_cycle logic
+│   ├── scalper_agent.py             # ScalperAgent — Tier 1, EMA 9/21
+│   ├── momentum_agent.py            # MomentumAgent — Tier 2, EMA 9/21
+│   ├── macro_agent.py               # MacroTraderAgent — EMA 50/200
+│   └── speculative_agent.py         # SpeculativeAgent — Tier 3, EMA 21/55
+│
+├── configs/                         # Per-agent YAML configuration files
+│   ├── agent_scalper.yaml
+│   ├── agent_momentum.yaml
+│   ├── agent_macro.yaml
+│   └── agent_speculative.yaml
+│
+└── tradingbot/
+    ├── core/                        # Lifecycle & configuration
+    │   ├── orchestrator.py          # OrchestratorBot — root process
+    │   ├── bot.py                   # Legacy TradingBot (single-agent)
+    │   ├── config.py                # Pydantic AppConfig + EnvSettings
+    │   └── state.py                 # Shared runtime state helpers
+    │
+    ├── engine/                      # Decision and risk layer
+    │   ├── trade_engine.py          # TradeEngine.process_symbol() — core pipeline
+    │   ├── risk_manager.py          # Position limits, daily loss, drawdown checks
+    │   ├── active_mode.py           # Active-mode helpers
+    │   └── passive_mode.py          # Passive-mode helpers
+    │
+    ├── market/                      # Exchange connectivity
+    │   ├── ccxt_connector.py        # CCXTConnector — async Binance adapter
+    │   └── data_collector.py        # OHLCV + ticker fetching with caching
+    │
+    ├── execution/                   # Order routing & portfolio state
+    │   ├── order_executor.py        # Paper & real order execution
+    │   └── portfolio_manager.py     # SQLAlchemy sync + async DB operations
+    │
+    ├── strategies/                  # Signal generation
+    │   ├── base_strategy.py         # Abstract strategy interface
+    │   ├── ema_crossover.py         # EMA 9/21 crossover signal
+    │   └── ema_macro.py             # EMA 50/200 with volume filter
+    │
+    ├── database/                    # Persistence layer
+    │   ├── models.py                # SQLAlchemy models (Trade, Portfolio, etc.)
+    │   └── repository.py            # Generic query helpers
+    │
+    ├── interfaces/
+    │   └── telegram/
+    │       ├── telegram_listener.py # Command handlers (/status, /buy, /pause, …)
+    │       └── notifier.py          # Outbound Telegram alerts
+    │
+    ├── services/                    # Background analytics services
+    │   ├── market_bias_service.py   # BTC EMA-50 macro filter
+    │   └── profit_harvest_service.py# Auto-harvest on +100% gain
+    │
+    └── utils/
+        ├── logger.py                # Structured logging
+        ├── scheduler.py             # APScheduler helpers
+        └── clp_converter.py         # USD ↔ CLP conversion
+```
+
+## Layered Architecture
+
+The system has five logical layers that communicate top-down. No lower layer imports from a layer above it.
+
+```
+OrchestratorBot  ──────────────────────────────────  Core Layer
+    │  (spawns 4 sub-agents, distributes capital)
+    ▼
+BaseAgent / {Scalper|Momentum|Macro|Speculative}Agent ── Agent Layer
+    │  (owns scheduler, strategy, run_cycle)
+    ▼
+TradeEngine.process_symbol()  ──────────────────────  Engine Layer
+    │  (signal → risk check → execute → record)
+    ▼
+CCXTConnector + OrderExecutor + PortfolioManager ───  Market/Execution Layer
+    │  (Binance API, paper orders, DB writes)
+    ▼
+SQLite (WAL mode, sync + aiosqlite async sessions) ──  Persistence Layer
+```
+
+### Core Layer — `tradingbot/core/`
+
+`OrchestratorBot` is the true process root. It reads the total portfolio equity, distributes capital across four sub-agents via `_assign_capital()`, and launches each agent in a dedicated daemon thread. `TradingBot` (in `bot.py`) is the legacy single-agent entry point kept for backward compatibility. `config.py` provides two configuration entry points: `load_yaml_config()` parses a YAML file into a Pydantic `AppConfig` model, and `get_settings()` reads secrets from `.env` via `EnvSettings` (a `pydantic_settings.BaseSettings` subclass).
+
+### Engine Layer — `tradingbot/engine/`
+
+`TradeEngine` contains the full decision pipeline in `process_symbol()`: fetch OHLCV data → generate a signal → check open-trade exits (TP, SL, Hard Stop, Safe Time-Stop) → apply BTC macro bias filter → enforce risk limits → execute a Micro DCA tranche → persist the result. `RiskManager` enforces position caps (`max_open_positions`), daily loss limits, and per-trade stop-loss percentages before any order is placed.
+
+### Market Layer — `tradingbot/market/`
+
+`CCXTConnector` wraps the CCXT async Binance adapter with three reliability features: a 24-hour in-memory and disk cache for exchange market metadata (avoiding repeated 25-second `load_markets()` calls), automatic exponential-backoff retry for network timeouts, and configurable sandbox/testnet mode. `DataCollector` provides `get_historical_data()` returning a pandas DataFrame of OHLCV candles.
+
+### Execution Layer — `tradingbot/execution/`
+
+`OrderExecutor` switches between paper-trading mode (mock orders with live ticker price) and real execution via `CCXTConnector.create_order()`. `PortfolioManager` wraps SQLAlchemy with both synchronous and `aiosqlite`-backed async sessions, configured with SQLite WAL mode and a 15-second busy timeout to handle concurrent writes from all four agent threads simultaneously.
+
+### Strategies Layer — `tradingbot/strategies/`
+
+`EMACrossoverStrategy` computes EMA fast/slow periods on the OHLCV DataFrame and returns a `BUY`, `SELL`, or `HOLD` string signal. `EMAMacroStrategy` extends this with an optional volume filter that suppresses signals when volume is below average — critical for BTC/ETH to avoid dead crosses.
+
+### Interfaces Layer — `tradingbot/interfaces/telegram/`
+
+`TelegramListener` maps inbound Telegram commands (`/status`, `/pause`, `/resume`, `/buy`, `/sell`, `/resume_speculative`, etc.) to `OrchestratorBot` methods. `TelegramNotifier` sends HTML-formatted trade alerts, error reports, and the `/status` panel back to the configured chat ID.
+
+## Async Architecture
+
+Every trading cycle is fully asynchronous. The APScheduler `BackgroundScheduler` calls the synchronous wrapper `_run_cycle_sync()` every 60 seconds, which internally calls `asyncio.run(self.run_cycle())`. Within `run_cycle()`, all symbols assigned to an agent are processed concurrently with a single `asyncio.gather()` call — each symbol's `TradeEngine.process_symbol()` coroutine runs in parallel. Database writes use `aiosqlite` via SQLAlchemy's async session factory to avoid blocking the event loop during I/O.
+
+```python
+# agents/base_agent.py — concurrent symbol processing
+tasks = [
+    self.trade_engine.process_symbol(symbol, current_tf, capital, data_collector, order_executor)
+    for symbol in self.config.bot.trading_pairs
+]
+results = await asyncio.gather(*tasks, return_exceptions=True)
+```
+
+<CardGroup cols={2}>
+  <Card title="Multi-Agent System" icon="sitemap" href="/architecture/multi-agent-system">
+    How the four sub-agents are initialized, how capital is distributed between Scenario A and B, and the full `BaseAgent` interface.
+  </Card>
+  <Card title="Trading Cycle" icon="rotate" href="/architecture/trading-cycle">
+    The complete per-symbol decision pipeline: anti-repainting check, EMA signal, risk gates, Micro DCA execution, and DecisionLog persistence.
+  </Card>
+  <Card title="EMA Crossover Strategy" icon="chart-line" href="/strategies/ema-crossover">
+    How `EMACrossoverStrategy` and `EMAMacroStrategy` generate BUY/SELL/HOLD signals from OHLCV data.
+  </Card>
+  <Card title="Risk Management" icon="shield-halved" href="/strategies/risk-management">
+    Take-profit, stop-loss, Hard Stop, Safe Time-Stop, daily loss limits, and BTC macro bias filter.
+  </Card>
+</CardGroup>

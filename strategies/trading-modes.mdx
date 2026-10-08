@@ -1,0 +1,212 @@
+---
+title: "Trading Modes: Trend, Target, and Scalper Explained"
+sidebarTitle: "Trading Modes"
+description: "Learn how each of the three trading modes changes exit logic, stop-loss behaviour, and trade frequency — and when to choose each one for your market conditions."
+---
+
+Trading Agent Bot supports three distinct behavioral modes that change how the trade engine manages open positions. Switching modes does **not** change the entry signal — the EMA crossover still triggers BUY at the same moment regardless of mode. What changes is the **exit logic**: how aggressively losses are cut, whether profit targets are hard or flexible, and how quickly winning trades are closed. The active mode is stored in `config.yaml` under `bot.trading_mode` and can be changed at runtime without restarting the bot via a Telegram command or inline keyboard button.
+
+<CardGroup cols={3}>
+  <Card title="Trend" icon="chart-line">
+    Cuts losses fast and exits on EMA reversal. Best for sustained bull markets where trend-following pays.
+  </Card>
+  <Card title="Target" icon="bullseye">
+    Never closes at a loss — holds until the fixed take-profit percentage is reached. Best for sideways, ranging markets.
+  </Card>
+  <Card title="Scalper" icon="bolt">
+    Closes micro-gains at +0.5% with a time-based safety exit. Best for high-volatility, choppy markets.
+  </Card>
+</CardGroup>
+
+---
+
+## Mode 1 — Trend
+
+In `trend` mode the bot follows the EMA signal aggressively. When the strategy issues a `SELL` signal (fast EMA crossing below slow EMA) on a symbol where a long position is open, the trade is closed immediately regardless of whether it is in profit or loss. The 2% stop-loss (`max_loss_per_trade_pct`) is also active as a secondary floor.
+
+**How exits trigger in `trend` mode:**
+
+```python
+# From tradingbot/engine/trade_engine.py — manage_open_trades()
+tp_pct = self.config.risk.default_take_profit_pct      # 4%
+sl_pct = self.config.risk.max_loss_per_trade_pct        # 2%
+trading_mode = getattr(self.config.bot, "trading_mode", "trend")
+
+# Take Profit
+if current_price >= price_entry * (1 + tp_pct):
+    should_close, close_reason = True, f"Take Profit (+{tp_pct*100:.1f}%)"
+
+# Stop Loss — active in trend mode
+elif current_price <= price_entry * (1 - sl_pct) and trading_mode not in ["target", "scalper"]:
+    should_close, close_reason = True, f"Stop Loss (-{sl_pct*100:.1f}%)"
+
+# Strategy reversal exit — active in trend mode
+elif current_signal == "SELL" and trading_mode not in ["target", "scalper"]:
+    should_close, close_reason = True, "Reversión de Estrategia"
+```
+
+<Tip>
+  `trend` mode pairs well with the `MacroTraderAgent` configuration (`configs/agent_macro.yaml`), which sets `trading_mode: "trend"` explicitly. Major BTC/ETH trend reversals are best handled by cutting the position immediately on a Death Cross.
+</Tip>
+
+---
+
+## Mode 2 — Target
+
+`target` mode disables both the standard stop-loss and the strategy-reversal exit. The bot holds the position until the price climbs to the configured take-profit percentage, effectively turning every open trade into a "hold until green" position.
+
+This is useful in **sideways or mean-reverting markets** where a brief dip below the entry price is likely to recover. The risk is that in a genuine downtrend the position freezes capital indefinitely — the only exits that remain active in `target` mode are the **hard stop-loss emergency exit** (default 4.5%) and the take-profit itself.
+
+```python
+# Stop Loss is skipped in target mode:
+elif current_price <= price_entry * (1 - sl_pct) and trading_mode not in ["target", "scalper"]:
+    should_close = True   # ← Does NOT fire when mode == "target"
+
+# Strategy reversal is also skipped:
+elif current_signal == "SELL" and trading_mode not in ["target", "scalper"]:
+    should_close = True   # ← Does NOT fire when mode == "target"
+
+# Hard emergency stop (flash-crash protection) — ALWAYS active regardless of mode:
+hard_sl_pct = getattr(ts_cfg, "hard_stop_loss_pct", 0.045)   # 4.5% default
+if pnl_pct <= -hard_sl_pct:
+    should_close, close_reason = True, f"Hard Stop Loss Emergencia (-{hard_sl_pct*100:.1f}%)"
+```
+
+<Warning>
+  In a sharp market crash `target` mode will hold open positions until the hard stop-loss at 4.5% fires or until the price recovers to the take-profit. This can freeze significant capital for hours or days. Only use `target` mode when you have high conviction the market is ranging and not in a structural downtrend.
+</Warning>
+
+---
+
+## Mode 3 — Scalper
+
+`scalper` mode reduces the take-profit to **+0.5%** and adds a time-based safety exit ("Safe Time-Stop"). This is designed for highly volatile markets where small, frequent gains compound faster than waiting for a 4% move. The trade-off is high transaction frequency and exchange fees.
+
+**Take-profit override in scalper mode:**
+
+```python
+current_tp_pct = tp_pct                        # 4% default
+if trading_mode == "scalper":
+    current_tp_pct = 0.005                     # Override: +0.5%
+
+if current_price >= price_entry * (1 + current_tp_pct):
+    should_close, close_reason = True, f"Take Profit (+{current_tp_pct*100:.1f}%)"
+```
+
+**Safe Time-Stop** prevents capital from being locked in a stale scalp that has not moved. After `min_duration_minutes` (default: 120 min) the bot checks the position on every cycle. If the position is in loss for `consecutive_cycles_required` (default: 3) consecutive cycles it is closed. If the price bounces back to positive during this window the counter resets, giving the trade another chance to hit take-profit.
+
+```python
+# Time-Stop config from config.yaml
+time_stop:
+  enabled: true
+  min_duration_minutes: 120
+  consecutive_cycles_required: 3
+  max_loss_pct: 0.02
+  hard_stop_loss_pct: 0.045
+  oversold_grace_enabled: true
+```
+
+```python
+# Safe Time-Stop logic — from manage_open_trades()
+elif not should_close and trading_mode == "scalper" and ts_cfg and getattr(ts_cfg, "enabled", True):
+    min_duration = getattr(ts_cfg, "min_duration_minutes", 120)
+    consecutive_req = getattr(ts_cfg, "consecutive_cycles_required", 3)
+
+    if duration_minutes >= min_duration:
+        if pnl_pct < 0:
+            c_count = self.time_stop_tracker.get(trade.trade_id, 0) + 1
+            self.time_stop_tracker[trade.trade_id] = c_count
+            if c_count >= consecutive_req:
+                should_close = True
+                close_reason = (
+                    f"Safe Time-Stop ({int(duration_minutes)}m + "
+                    f"{c_count}x Confirmado, PnL {pnl_pct*100:.2f}%)"
+                )
+        else:
+            # Price bounced — reset the counter
+            self.time_stop_tracker.pop(trade.trade_id, None)
+```
+
+<Info>
+  The `time_stop_tracker` dictionary is in-memory, keyed by `trade_id`. It persists across cycles but resets on bot restart. If the bot restarts while a scalp is open the consecutive-cycle counter starts from zero.
+</Info>
+
+---
+
+## Mode Comparison
+
+<Accordion title="Trend — pros and cons">
+  **Best for:** Bull markets, clear directional breakouts, macro trend-following.
+
+  | Pros | Cons |
+  |------|------|
+  | Losses cut immediately on reversal | Frequent stop-outs in choppy markets |
+  | Capital recycled quickly | Whipsaws around the EMA can trigger repeated SL |
+  | Follows strong trends to their full TP | Misses V-shaped recoveries after SL |
+</Accordion>
+
+<Accordion title="Target — pros and cons">
+  **Best for:** Sideways / ranging markets, mean-reverting pairs, low-volatility periods.
+
+  | Pros | Cons |
+  |------|------|
+  | Never closes a trade at a small loss | Freezes capital in genuine downtrends |
+  | Maximises profit on recovering trades | Only hard stop (4.5%) protects against crashes |
+  | Fewer unnecessary exits in noise | Can accumulate unrealised losses silently |
+</Accordion>
+
+<Accordion title="Scalper — pros and cons">
+  **Best for:** High-volatility markets, BTC pump/dump cycles, liquid altcoins.
+
+  | Pros | Cons |
+  |------|------|
+  | Frequent small profits compound quickly | Higher total fee cost per day |
+  | Safe Time-Stop prevents frozen capital | 0.5% TP may not cover fees on some exchanges |
+  | Works in both trending and choppy markets | Lower single-trade profitability |
+</Accordion>
+
+---
+
+## Switching Modes
+
+### Via `config.yaml`
+
+Edit `bot.trading_mode` before starting the bot, or update it while the bot is running (it is reloaded on the next `BotCommand` cycle):
+
+```yaml
+bot:
+  trading_mode: "scalper"   # Options: "trend" | "target" | "scalper"
+```
+
+### Via Telegram
+
+Send the `/mode` command followed by the mode name, or tap the inline keyboard buttons that appear after `/status`:
+
+```
+/mode trend
+/mode target
+/mode scalper
+```
+
+The Telegram listener writes a `BotCommand` record to the database with `command=MODE` and `args=<mode>`. The bot's `_process_dashboard_commands()` method picks this up every 5 seconds and persists the change directly to `config.yaml`:
+
+```python
+elif c_name == 'MODE':
+    if c_args in ['trend', 'target', 'scalper']:
+        self.config.bot.trading_mode = c_args
+        # Persist to config.yaml immediately
+        import yaml
+        with open("config.yaml", "r") as f:
+            data = yaml.safe_load(f)
+        if "bot" in data:
+            data["bot"]["trading_mode"] = c_args
+        with open("config.yaml", "w") as f:
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+        log.info(f"DASHBOARD CMD: Mode changed to {c_args}")
+```
+
+<Note>
+  The mode change takes effect on the **next trading cycle** (within 1 minute). Open positions that were entered under the previous mode are evaluated under the **new** mode's exit rules from that point forward.
+</Note>
+
+For a full reference of all Telegram commands including `/mode`, see the [Telegram Commands](/telegram/commands) page.

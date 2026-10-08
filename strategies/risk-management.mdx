@@ -1,0 +1,444 @@
+---
+title: "Risk Management: Guards, Limits, and Position Sizing"
+sidebarTitle: "Risk Management"
+description: "Complete reference for every risk control in Trading Agent Bot — from position limits and daily loss guards to trailing stops, Micro-DCA order splitting, and automatic profit harvesting."
+---
+
+Trading Agent Bot enforces risk at multiple independent layers. Before any BUY order is placed, the `RiskManager` verifies position count, capital exposure, and daily loss limits. While a position is open, the `TradeEngine` continuously monitors take-profit, stop-loss, trailing stop, hard emergency stop, and a time-based safety exit. Layered on top are two optional services — the `BTCMarketBiasFilter` that gates all altcoin entries on Bitcoin's macro trend, and the `ProfitHarvestEngine` that automatically liquidates extraordinary gains. All settings live under the `risk:` block in `config.yaml`.
+
+## Full `config.yaml` Risk Section
+
+```yaml
+risk:
+  # Maximum number of simultaneous open positions
+  max_open_positions: 10
+
+  # Maximum percentage of total capital allowed in the market
+  max_capital_exposure_pct: 1.00
+
+  # Per-coin capital reserve (25% held back, max order = 75% of coin allocation)
+  coin_reserve_pct: 0.25
+  max_coin_order_pct: 0.75
+  min_order_usd: 0.10
+
+  # Maximum loss per individual trade (2%) — used for stop-loss and position sizing
+  max_loss_per_trade_pct: 0.02
+
+  # Daily loss limit (5%) — halts all trading if reached
+  daily_loss_limit_pct: 0.05
+
+  # Maximum drawdown from peak (20%) — halts all trading if reached
+  max_drawdown_pct: 0.20
+
+  # Default take-profit target (4%)
+  default_take_profit_pct: 0.04
+
+  # Trailing stop — follows price upward at 2% distance
+  trailing_stop: true
+  trailing_stop_positive: 0.02
+
+  # Time-based safety exit for stale scalper positions
+  time_stop:
+    enabled: true
+    min_duration_minutes: 120
+    consecutive_cycles_required: 3
+    max_loss_pct: 0.02
+    hard_stop_loss_pct: 0.045
+    oversold_grace_enabled: true
+
+  # BTC macro trend filter — blocks altcoin entries when BTC is bearish
+  market_bias:
+    enabled: true
+    btc_symbol: "BTC/USDT"
+    timeframe: "1h"
+    ema_period: 50
+    cache_ttl_seconds: 60
+
+  # Order splitting into two tranches (Initial 53.33% + Pullback 46.67%)
+  micro_dca:
+    enabled: true
+    initial_tranche_pct: 0.5333
+    pullback_tranche_pct: 0.4667
+    pullback_min_pct: 0.006
+    pullback_max_pct: 0.025
+
+  # Automatic profit harvesting when unrealised gain exceeds threshold
+  profit_harvest:
+    enabled: true
+    threshold_pct: 1.00     # +100% ROI
+    threshold_usd: 15.00    # OR $15 USD unrealised gain
+    harvest_ratio: 1.00
+```
+
+---
+
+## RiskManager Methods
+
+The `RiskManager` class provides the pre-trade validation layer. It is instantiated once in `TradingBot.__init__()` and injected into `TradeEngine`.
+
+<ParamField path="can_open_position" type="method">
+  Checks whether a new position can be opened given the current count of open positions.
+</ParamField>
+
+```python
+def can_open_position(self, current_open_positions: int) -> bool:
+    """
+    Checks if a new position can be opened based on max_open_positions.
+    """
+    if current_open_positions >= self.risk_config.max_open_positions:
+        log.warning(
+            f"Cannot open position: Current positions ({current_open_positions}) "
+            f"reached limit ({self.risk_config.max_open_positions})."
+        )
+        return False
+    return True
+```
+
+<ParamField path="check_capital_exposure" type="method">
+  Verifies that the ratio of capital currently deployed does not exceed `max_capital_exposure_pct`.
+</ParamField>
+
+```python
+def check_capital_exposure(self, current_exposure: float, total_capital: float) -> bool:
+    """
+    Checks if current capital exposure is within max_capital_exposure_pct limit.
+    """
+    if total_capital <= 0:
+        log.error("Total capital must be greater than zero to check exposure.")
+        return False
+
+    exposure_pct = current_exposure / total_capital
+    if exposure_pct >= self.risk_config.max_capital_exposure_pct:
+        log.warning(
+            f"High capital exposure: {exposure_pct:.2%} exceeds "
+            f"limit of {self.risk_config.max_capital_exposure_pct:.2%}."
+        )
+        return False
+    return True
+```
+
+<ParamField path="check_daily_loss" type="method">
+  Compares the absolute daily loss against `daily_loss_limit_pct` of total capital. Accepts either a positive or negative float for `daily_loss`.
+</ParamField>
+
+```python
+def check_daily_loss(self, daily_loss: float, total_capital: float) -> bool:
+    """
+    Checks if daily loss has exceeded daily_loss_limit_pct.
+    daily_loss should be a positive float representing the absolute amount lost.
+    """
+    if total_capital <= 0:
+        return False
+
+    loss_pct = abs(daily_loss) / total_capital
+    if loss_pct >= self.risk_config.daily_loss_limit_pct:
+        log.warning(
+            f"Daily loss limit reached: {loss_pct:.2%} >= "
+            f"{self.risk_config.daily_loss_limit_pct:.2%}."
+        )
+        return False
+    return True
+```
+
+<ParamField path="calculate_position_size" type="method">
+  Computes the number of units to trade based on the dollar risk per trade and the price distance to stop-loss. Respects slot budget and total capital exposure limits.
+</ParamField>
+
+```python
+def calculate_position_size(
+    self,
+    total_capital: float,
+    entry_price: float,
+    stop_loss_price: float,
+    is_dca: bool = False
+) -> float:
+    """
+    Calculates position size based on max_loss_per_trade_pct and slot allocation.
+    Returns the number of units to trade.
+    """
+    if total_capital <= 0 or entry_price <= 0 or stop_loss_price <= 0:
+        return 0.0
+    if entry_price == stop_loss_price:
+        return 0.0
+
+    risk_amount = total_capital * self.risk_config.max_loss_per_trade_pct
+    price_risk_per_unit = abs(entry_price - stop_loss_price)
+    position_size = risk_amount / price_risk_per_unit
+
+    usable_exposure_pct = self.risk_config.max_capital_exposure_pct
+    if not is_dca:
+        usable_exposure_pct = max(
+            0.05,
+            usable_exposure_pct - getattr(self.risk_config, "reserve_capital_pct", 0.30)
+        )
+
+    max_positions = max(1, getattr(self.risk_config, "max_open_positions", 10))
+    slot_budget = (total_capital * usable_exposure_pct) / max_positions
+    min_order = getattr(self.risk_config, "min_order_usd", 1.0)
+    max_investment = min(
+        total_capital * self.risk_config.max_capital_exposure_pct,
+        max(slot_budget, min_order)
+    )
+
+    if position_size * entry_price > max_investment:
+        position_size = max_investment / entry_price
+
+    return position_size
+```
+
+---
+
+## Individual Risk Controls
+
+<Accordion title="1. Max Open Positions — max_open_positions">
+  **Config key:** `risk.max_open_positions` | **Default:** `10`
+
+  Hard ceiling on the total number of concurrent open positions across all symbols. When `current_open_positions >= max_open_positions`, `can_open_position()` returns `False` and the BUY is blocked with a `BLOCKED` decision logged to the database.
+
+  ```python
+  if not self.risk_manager.can_open_position(current_positions):
+      return {
+          'symbol': symbol,
+          'decision': 'BLOCKED',
+          'reason': f"Límite de posiciones abiertas alcanzado ({current_positions}/{self.config.risk.max_open_positions})"
+      }
+  ```
+
+  Per-agent overrides are common. The MacroTraderAgent sets `max_open_positions: 2` since it only trades BTC and ETH.
+</Accordion>
+
+<Accordion title="2. Capital Exposure — max_capital_exposure_pct">
+  **Config key:** `risk.max_capital_exposure_pct` | **Default:** `1.00` (100%)
+
+  Defines the maximum fraction of total equity that may be deployed in open positions at any time. `check_capital_exposure(current_exposure, total_capital)` divides the deployed amount by total capital and blocks new entries if the ratio equals or exceeds this threshold.
+
+  ```yaml
+  risk:
+    max_capital_exposure_pct: 1.00   # 100% — all capital may be deployed
+    coin_reserve_pct: 0.25           # Per coin: 25% always reserved
+    max_coin_order_pct: 0.75         # Per coin: max order = 75% of coin allocation
+    min_order_usd: 0.10              # Minimum order size in USD
+  ```
+
+  The `coin_reserve_pct` creates a per-symbol capital buffer: with a $1.00 base allocation per coin, the maximum single order is $0.75 USD (before Micro-DCA splitting).
+</Accordion>
+
+<Accordion title="3. Daily Loss Limit — daily_loss_limit_pct">
+  **Config key:** `risk.daily_loss_limit_pct` | **Default:** `0.05` (5%)
+
+  If the total realised losses for the current calendar day exceed 5% of total capital, `check_daily_loss()` returns `False` and all new BUY orders are blocked for the remainder of the day. The check is called inside `process_symbol()` immediately before each new trade execution.
+
+  ```python
+  if not self.risk_manager.check_daily_loss(0.0, total_equity):
+      return {
+          'symbol': symbol,
+          'decision': 'BLOCKED',
+          'reason': "Límite de pérdida diaria alcanzado"
+      }
+  ```
+</Accordion>
+
+<Accordion title="4. Max Drawdown — max_drawdown_pct">
+  **Config key:** `risk.max_drawdown_pct` | **Default:** `0.20` (20%)
+
+  Tracks the portfolio's peak equity. If the current equity falls more than 20% from the historical peak, all trading is suspended. This is a portfolio-level circuit breaker distinct from the per-trade stop-loss. The drawdown calculation runs in the portfolio manager and feeds into the orchestrator's health checks.
+
+  ```yaml
+  risk:
+    max_drawdown_pct: 0.20   # Stop all trading if portfolio drops 20% from peak
+  ```
+</Accordion>
+
+<Accordion title="5. Stop Loss — max_loss_per_trade_pct">
+  **Config key:** `risk.max_loss_per_trade_pct` | **Default:** `0.02` (2%)
+
+  Per-trade stop-loss. In `trend` mode a position is closed when `current_price <= price_entry * (1 - 0.02)`. In `target` and `scalper` modes this standard SL is disabled; only the **hard emergency stop** (4.5%) remains active. The same percentage is used by `calculate_position_size()` to determine unit count from the dollar risk budget.
+
+  ```python
+  sl_pct = self.config.risk.max_loss_per_trade_pct  # 0.02
+
+  elif current_price <= price_entry * (1 - sl_pct) and trading_mode not in ["target", "scalper"]:
+      should_close, close_reason = True, f"Stop Loss (-{sl_pct*100:.1f}%)"
+  ```
+</Accordion>
+
+<Accordion title="6. Take Profit — default_take_profit_pct">
+  **Config key:** `risk.default_take_profit_pct` | **Default:** `0.04` (4%)
+
+  Static take-profit target. The position is closed when `current_price >= price_entry * 1.04`. In `scalper` mode this is overridden to **0.5%** at runtime. Individual agents can set their own `default_take_profit_pct`; the MacroTraderAgent uses 1.5% to match BTC/ETH's narrower daily range.
+
+  ```python
+  current_tp_pct = tp_pct                # 4% (or agent override)
+  if trading_mode == "scalper":
+      current_tp_pct = 0.005             # 0.5% in scalper mode
+
+  if current_price >= price_entry * (1 + current_tp_pct):
+      should_close, close_reason = True, f"Take Profit (+{current_tp_pct*100:.1f}%)"
+  ```
+</Accordion>
+
+<Accordion title="7. Trailing Stop — trailing_stop / trailing_stop_positive">
+  **Config keys:** `risk.trailing_stop`, `risk.trailing_stop_positive` | **Defaults:** `true`, `0.02` (2%)
+
+  When enabled, the trailing stop follows the price upward and triggers a close if the price retreats more than `trailing_stop_positive` (2%) from the most recent peak. This allows profitable trades to run further while locking in gains automatically. The trailing stop is active in all three trading modes and is evaluated alongside the static take-profit.
+
+  ```yaml
+  risk:
+    trailing_stop: true
+    trailing_stop_positive: 0.02   # 2% trailing distance from peak price
+  ```
+
+  The MacroTraderAgent tightens this to `0.008` (0.8%) to accommodate BTC/ETH's slower-moving trends without giving back too much gain.
+</Accordion>
+
+<Accordion title="8. Time-Based Stop — time_stop">
+  **Config key:** `risk.time_stop` | **Default:** enabled, 120 min, 3 consecutive cycles
+
+  The Safe Time-Stop prevents capital from being frozen indefinitely in a stalled scalper position. It activates only in `scalper` mode. After `min_duration_minutes` (120 min) the bot tracks how many consecutive evaluation cycles the position has remained in loss. After `consecutive_cycles_required` (3) consecutive cycles in loss, the position is closed regardless of the loss amount.
+
+  If the price recovers to break-even or better during the watch window, the consecutive counter resets — giving the trade another chance to reach take-profit.
+
+  ```yaml
+  time_stop:
+    enabled: true
+    min_duration_minutes: 120          # Position must be open ≥ 2 hours
+    consecutive_cycles_required: 3     # Must be in loss for 3 consecutive cycles
+    max_loss_pct: 0.02                 # Reference loss threshold
+    hard_stop_loss_pct: 0.045          # Emergency hard stop (flash crash, all modes)
+    oversold_grace_enabled: true       # Grace period for oversold rebounds
+  ```
+
+  <Note>
+    The `hard_stop_loss_pct: 0.045` (4.5%) is a **universal emergency exit** — it fires in all three modes regardless of `trading_mode`. It acts as a final flash-crash circuit breaker that cannot be disabled by mode configuration.
+  </Note>
+</Accordion>
+
+<Accordion title="9. Market Bias Filter — market_bias">
+  **Config key:** `risk.market_bias` | **Default:** enabled, BTC/USDT 1h EMA 50
+
+  Before entering any altcoin position, the bot fetches the BTC/USDT 1-hour close price and compares it against its EMA 50. If BTC is below its EMA 50 (`BEARISH`), all altcoin BUY signals are blocked. BTC/USDT itself is never filtered by this check.
+
+  ```python
+  # From BTCMarketBiasFilter.get_btc_bias()
+  if last_close >= last_ema:
+      self._cached_bias = "BULLISH"
+      self._cached_reason = f"BTC 1h ${last_close:,.2f} >= EMA{self.ema_period} ${last_ema:,.2f}"
+  else:
+      self._cached_bias = "BEARISH"
+      self._cached_reason = f"BTC 1h ${last_close:,.2f} < EMA{self.ema_period} ${last_ema:,.2f}"
+  ```
+
+  The result is cached in memory for `cache_ttl_seconds` (60 seconds) to avoid hammering the exchange API on every symbol evaluation within the same cycle.
+
+  ```yaml
+  market_bias:
+    enabled: true
+    btc_symbol: "BTC/USDT"
+    timeframe: "1h"
+    ema_period: 50
+    cache_ttl_seconds: 60
+  ```
+
+  When a BUY is blocked by this filter the trade engine returns:
+  ```python
+  return {
+      'symbol': symbol,
+      'decision': 'BLOCKED',
+      'reason': f"BTC Macro Bias Bearish ({bias_reason})"
+  }
+  ```
+</Accordion>
+
+<Accordion title="10. Micro-DCA — micro_dca">
+  **Config key:** `risk.micro_dca` | **Default:** enabled, 53.33% / 46.67% split
+
+  Instead of entering a full position in one order, Micro-DCA splits the coin allocation into two tranches. The **first tranche** (53.33% of the coin's usable capital) is placed immediately on a BUY signal. The **second tranche** (46.67%) is triggered only if the price pulls back between 0.6% and 2.5% from the first entry price — lowering the average cost basis.
+
+  ```yaml
+  micro_dca:
+    enabled: true
+    initial_tranche_pct: 0.5333      # Tranche 1: 53.33% of coin allocation
+    pullback_tranche_pct: 0.4667     # Tranche 2: 46.67% of coin allocation
+    pullback_min_pct: 0.006          # Pullback must be ≥ 0.6% to trigger
+    pullback_max_pct: 0.025          # Pullback must be ≤ 2.5% to trigger
+  ```
+
+  **Tranche 1 execution** — on initial BUY signal:
+  ```python
+  if is_dca_enabled:
+      tranche_1_pct = getattr(micro_dca_cfg, "initial_tranche_pct", 0.5333)
+      order_usd = min(round(full_coin_alloc * tranche_1_pct, 4), available_cash)
+      dca_step = 1
+  ```
+
+  **Tranche 2 execution** — on pullback detection in a subsequent cycle:
+  ```python
+  price_drop = (entry_price - current_price) / entry_price
+  pullback_min = getattr(micro_dca_cfg, "pullback_min_pct", 0.006)
+  pullback_max = getattr(micro_dca_cfg, "pullback_max_pct", 0.025)
+
+  if pullback_min <= price_drop <= pullback_max:
+      tranche_2_pct = getattr(micro_dca_cfg, "pullback_tranche_pct", 0.4667)
+      order_usd_2 = min(round(full_coin_alloc * tranche_2_pct, 4), available_cash)
+  ```
+
+  After tranche 2 is filled, `PortfolioManager.consolidate_dca_position_async()` merges both fills into a single trade record with the weighted average entry price.
+
+  <Tip>
+    The MacroTraderAgent uses an even 50/50 split (`initial_tranche_pct: 0.50`, `pullback_tranche_pct: 0.50`) with tighter pullback bounds (0.4%–1.5%) suited to BTC/ETH's narrower price swings.
+  </Tip>
+</Accordion>
+
+<Accordion title="11. Profit Harvesting — profit_harvest">
+  **Config key:** `risk.profit_harvest` | **Default:** enabled, +100% ROI or $15 USD
+
+  `ProfitHarvestEngine` runs as a background service and scans all portfolio positions. When an asset's unrealised PnL meets either threshold (percentage **or** absolute USD — whichever fires first), the entire position is liquidated and the proceeds are credited to the liquid cash wallet.
+
+  ```python
+  # From ProfitHarvestEngine.scan_and_harvest()
+  pnl_pct = u_pnl / cost_basis if cost_basis > 0 else 0.0
+  should_harvest = (pnl_pct >= self.threshold_pct) or (u_pnl >= self.threshold_usd)
+  ```
+
+  ```yaml
+  profit_harvest:
+    enabled: true
+    threshold_pct: 1.00    # Harvest at +100% unrealised gain (2× return)
+    threshold_usd: 15.00   # OR harvest when unrealised gain exceeds $15 USD
+    harvest_ratio: 1.00    # Liquidate 100% of the position
+  ```
+
+  On a successful harvest the bot sends a detailed Telegram notification:
+
+  ```
+  💰 COSECHA AUTOMÁTICA DE GANANCIAS (Profit Harvest)
+
+  🎉 Se liquidó la posición extraordinaria en SOL para asegurar ganancias:
+  • Cantidad: 0.8450 SOL
+  • Precio Venta: $185.4200 USD
+  • Ganancia Realizada: +$16.73 USD (+108.3%)
+  • Capital Acreditado a Billetera: +$32.18 USD
+  • Nuevo Saldo Líquido Disponible: $67.45 USDT
+  ```
+
+  The MacroTraderAgent lowers the harvest threshold to `threshold_pct: 0.50` (+50%) to capture outsized BTC/ETH moves before they reverse.
+</Accordion>
+
+---
+
+## Coin Fund Isolation
+
+Each trading symbol is allocated a base fund of **$1.00 USD**. The bot tracks cumulative realised PnL per `(agent_id, symbol)` pair. If the total PnL for a coin brings the balance to $0 or below, that coin is permanently set to **OFF** for the agent — no new BUYs are placed — and a forensic loss report is written to disk.
+
+```python
+coin_balance = base_coin_usd + coin_realized_pnl   # 1.00 + cumulative PnL
+if coin_balance <= 0.0:
+    log.warning(f"[{agent_id}] Fondo de {symbol} agotado (${coin_balance:.2f} USD). Estado: OFF.")
+    return {
+        'symbol': symbol,
+        'decision': 'BLOCKED',
+        'reason': f"Fondo agotado (${coin_balance:.2f} USD) | Estado OFF"
+    }
+```
+
+This ensures a single underperforming coin cannot drain the capital of other symbols within the same agent.

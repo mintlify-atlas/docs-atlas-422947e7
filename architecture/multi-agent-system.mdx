@@ -1,0 +1,357 @@
+---
+title: "Multi-Agent System: Four Parallel Trading Sub-Agents"
+sidebarTitle: "Multi-Agent System"
+description: "How OrchestratorBot initializes, funds, and controls four specialized sub-agents running in parallel threads with per-agent capital pools and independent schedulers."
+---
+
+Trading Agent Bot replaces a monolithic trading loop with a coordinated fleet of four specialized sub-agents. Each sub-agent owns its own APScheduler instance, its own YAML configuration, its own slice of the total capital, and its own trading strategy. The `OrchestratorBot` acts as the single process root: it fetches total portfolio equity on startup, distributes capital using a fixed matrix, launches each agent in a dedicated daemon thread, and exposes per-agent control commands through the Telegram interface. No sub-agent communicates directly with another — all coordination flows through the orchestrator.
+
+## OrchestratorBot Responsibilities
+
+`OrchestratorBot` is defined in `tradingbot/core/orchestrator.py`. Its four primary responsibilities are capital distribution, lifecycle management, per-agent control, and global status reporting.
+
+```python
+# tradingbot/core/orchestrator.py
+class OrchestratorBot:
+    AGENT_CONFIGS = {
+        "scalper_t1":     "configs/agent_scalper.yaml",
+        "momentum_t2":    "configs/agent_momentum.yaml",
+        "speculative_t3": "configs/agent_speculative.yaml",
+        "macro_btceth":   "configs/agent_macro.yaml",
+    }
+
+    def __init__(self):
+        self.agents = {
+            "scalper_t1":     ScalperAgent(self.AGENT_CONFIGS["scalper_t1"]),
+            "momentum_t2":    MomentumAgent(self.AGENT_CONFIGS["momentum_t2"]),
+            "speculative_t3": SpeculativeAgent(self.AGENT_CONFIGS["speculative_t3"]),
+            "macro_btceth":   MacroTraderAgent(self.AGENT_CONFIGS["macro_btceth"]),
+        }
+```
+
+On `start_all()`, the orchestrator fetches the total equity, assigns capital, and launches each agent in its own thread:
+
+```python
+# tradingbot/core/orchestrator.py — start_all()
+total_capital = asyncio.run(self._fetch_total_capital())
+is_spec_active = self._is_speculative_active()
+self._assign_capital(total_capital, scenario_a=is_spec_active)
+
+for agent_id, agent in self.agents.items():
+    thread = threading.Thread(
+        target=agent.start,
+        name=f"agent-{agent_id}",
+        daemon=True
+    )
+    thread.start()
+```
+
+## Capital Distribution
+
+Capital is allocated according to a **coin matrix** — each of the 16 trading pairs across all agents gets a $1.00 USD base investment. The distribution shifts between two scenarios depending on whether `SpeculativeAgent` Tier 3 is active.
+
+### `_assign_capital()` Logic
+
+```python
+# tradingbot/core/orchestrator.py — _assign_capital()
+def _assign_capital(self, total_capital: float, scenario_a: bool = None):
+    if scenario_a is None:
+        scenario_a = self._is_speculative_active()
+
+    if scenario_a:
+        capital_split = {
+            "scalper_t1":     total_capital * 0.45,
+            "momentum_t2":    total_capital * 0.35,
+            "macro_btceth":   total_capital * 0.10,
+            "speculative_t3": total_capital * 0.10,
+        }
+    else:
+        capital_split = {
+            "scalper_t1":     total_capital * 0.50,
+            "momentum_t2":    total_capital * 0.40,
+            "macro_btceth":   total_capital * 0.10,
+            "speculative_t3": 0.0,
+        }
+
+    for agent_id, capital in capital_split.items():
+        if agent_id in self.agents:
+            self.agents[agent_id].set_capital(capital)
+```
+
+<Tabs>
+  <Tab title="Scenario B — Default (Tier 3 Passive)">
+    Scenario B is active on every fresh start. `SpeculativeAgent` receives zero capital and stays in `PASSIVE` mode. The freed 10% is redistributed to Scalper and Momentum.
+
+    | Agent | Allocation | Capital (on $16 base) | Pairs |
+    |---|---|---|---|
+    | ScalperAgent T1 | **50%** | $8.00 | 7 pairs |
+    | MomentumAgent T2 | **40%** | $6.40 | 5 pairs |
+    | MacroTraderAgent | **10%** | $1.60 | 2 pairs |
+    | SpeculativeAgent T3 | **0%** | $0.00 | 2 pairs (PASSIVE) |
+
+    Activate Tier 3 with `/resume_speculative` from Telegram to switch to Scenario A.
+  </Tab>
+  <Tab title="Scenario A — Tier 3 Active">
+    Scenario A is triggered automatically when `SpeculativeAgent` is resumed. Capital is rebalanced immediately by calling `_assign_capital(total, scenario_a=True)`.
+
+    | Agent | Allocation | Capital (on $16 base) | Pairs |
+    |---|---|---|---|
+    | ScalperAgent T1 | **45%** | $7.20 | 7 pairs |
+    | MomentumAgent T2 | **35%** | $5.60 | 5 pairs |
+    | MacroTraderAgent | **10%** | $1.60 | 2 pairs |
+    | SpeculativeAgent T3 | **10%** | $1.60 | 2 pairs |
+
+    Pause Tier 3 with `/pause_speculative` to revert to Scenario B.
+  </Tab>
+</Tabs>
+
+<Note>
+  The coin matrix baseline is **$1.00 USD per pair**. Each agent's individual coin fund is tracked independently: if a coin's cumulative realized PnL drives its balance to $0.00, that coin transitions to **OFF** state and a forensic markdown report is generated automatically.
+</Note>
+
+## The Four Sub-Agents
+
+<Accordion title="ScalperAgent — Tier 1 (50% capital, Scenario B)">
+  `ScalperAgent` is the highest-capital agent, optimized for short timeframes and high-liquidity pairs. It mixes stable anchor assets (SOL, BNB, XRP) with momentum leaders (SUI, NEAR, DOGE, ADA) for resilience in both trending and sideways markets.
+
+  **Configuration file:** `configs/agent_scalper.yaml`
+
+  ```yaml
+  agent:
+    name: "ScalperAgent_Tier1"
+    agent_id: "scalper_t1"
+    capital_pool_pct: 0.45           # 45% in Scenario A
+
+  bot:
+    mode: "active"
+    trading_mode: "scalper"
+    timeframe: "1m"
+    trading_pairs:
+      - "SOL/USDT"
+      - "BNB/USDT"
+      - "XRP/USDT"
+      - "SUI/USDT"
+      - "NEAR/USDT"
+      - "DOGE/USDT"
+      - "ADA/USDT"
+    dynamic_timeframe:
+      enabled: true
+      active_hours_utc:
+        start: 13
+        end: 21
+      active_timeframe: "1m"
+      passive_timeframe: "5m"
+
+  risk:
+    max_open_positions: 8
+    default_take_profit_pct: 0.04    # +4%
+    max_loss_per_trade_pct: 0.02     # -2%
+    hard_stop_loss_pct: 0.045        # Emergency -4.5%
+
+  strategies:
+    ema_crossover:
+      fast_period: 9
+      slow_period: 21
+  ```
+
+  The `scalper` trading mode enables the **Safe Time-Stop**: after 120 minutes, if a position shows 3 consecutive cycles in loss territory, it is closed automatically regardless of the SL percentage.
+</Accordion>
+
+<Accordion title="MomentumAgent — Tier 2 (40% capital, Scenario B)">
+  `MomentumAgent` targets AI and Layer-2 narrative tokens with high daily ranges (FET ~15.8%, STRK ~19.5%). It uses `trading_mode: target`, which means it only closes positions on Take Profit — it never cuts early on a reversal signal. This is intentional for volatile narrative assets that can whipsaw before breaking out.
+
+  **Configuration file:** `configs/agent_momentum.yaml`
+
+  ```yaml
+  agent:
+    name: "MomentumAgent_Tier2"
+    agent_id: "momentum_t2"
+    capital_pool_pct: 0.35           # 35% in Scenario A
+
+  bot:
+    mode: "active"
+    trading_mode: "target"           # Only closes on TP — no reversal exits
+    timeframe: "5m"
+    trading_pairs:
+      - "FET/USDT"
+      - "TAO/USDT"
+      - "WLD/USDT"
+      - "STRK/USDT"
+      - "QNT/USDT"
+    dynamic_timeframe:
+      enabled: true
+      active_hours_utc:
+        start: 12
+        end: 22
+      active_timeframe: "5m"
+      passive_timeframe: "15m"
+
+  risk:
+    max_open_positions: 5
+    default_take_profit_pct: 0.05    # +5%
+    max_loss_per_trade_pct: 0.025    # -2.5% (wider for narrative volatility)
+
+  strategies:
+    ema_crossover:
+      fast_period: 9
+      slow_period: 21
+  ```
+</Accordion>
+
+<Accordion title="MacroTraderAgent — BTC/ETH (10% capital, both scenarios)">
+  `MacroTraderAgent` trades only BTC/USDT and ETH/USDT using the institutional **Golden Cross / Death Cross** pattern (EMA 50/200). This generates only 2–5 signals per month but achieves ~65–70% take-profit rate. A volume filter suppresses signals when volume is below average, eliminating dead crosses.
+
+  **Configuration file:** `configs/agent_macro.yaml`
+
+  ```yaml
+  agent:
+    name: "MacroTrader_BTCETH"
+    agent_id: "macro_btceth"
+    capital_pool_pct: 0.10
+
+  bot:
+    mode: "active"
+    trading_mode: "trend"            # Cuts losses fast; follows macro direction
+    timeframe: "15m"
+    trading_pairs:
+      - "BTC/USDT"
+      - "ETH/USDT"
+    dynamic_timeframe:
+      enabled: true
+      active_hours_utc:
+        start: 13
+        end: 17                      # NY + London overlap — peak BTC liquidity
+      active_timeframe: "15m"
+      passive_timeframe: "1h"
+
+  risk:
+    max_open_positions: 2
+    default_take_profit_pct: 0.015   # +1.5% (tight, BTC ~1% daily range)
+    max_loss_per_trade_pct: 0.015    # -1.5%
+
+  strategies:
+    ema_macro:
+      fast_period: 50
+      slow_period: 200
+      volume_filter: true
+  ```
+
+  <Info>
+    The EMA 9/21 strategy was explicitly rejected for BTC/ETH: it generates 40–80 signals per month with ~70% false positives. EMA 50/200 reduces this to 20–25% false positives with far fewer commission costs.
+  </Info>
+</Accordion>
+
+<Accordion title="SpeculativeAgent — Tier 3 (0% capital by default, PASSIVE)">
+  `SpeculativeAgent` targets high-risk anomaly tokens (BEAMX, MUBARAK) susceptible to whale manipulation. It **always starts in PASSIVE mode** regardless of the YAML config, and receives zero capital in Scenario B. Human confirmation via `/resume_speculative` is required before it trades.
+
+  **Configuration file:** `configs/agent_speculative.yaml`
+
+  ```yaml
+  agent:
+    name: "SpeculativeAgent_Tier3"
+    agent_id: "speculative_t3"
+    capital_pool_pct: 0.10           # 10% only in Scenario A
+
+  bot:
+    mode: "active"                   # Overridden to PASSIVE by start() method
+    trading_mode: "scalper"
+    timeframe: "15m"                 # Longer candles filter false spikes
+    trading_pairs:
+      - "BEAMX/USDT"
+      - "MUBARAK/USDT"
+      # PEPE/USDT excluded: 0.23% spread destroys scalper margin
+
+  risk:
+    max_open_positions: 2
+    default_take_profit_pct: 0.06    # +6% (>20% daily ranges enable impulse capture)
+    max_drawdown_pct: 0.10           # Global halt at -10% pool drawdown
+
+  strategies:
+    ema_crossover:
+      fast_period: 21
+      slow_period: 55                # Slower EMA filters speculative noise
+  ```
+
+  The `SpeculativeAgent.start()` override always sets `paused = True` and `mode = "passive"` before delegating to `BaseAgent.start()`:
+
+  ```python
+  # agents/speculative_agent.py
+  def start(self):
+      mode = getattr(self.config.bot, "mode", "passive").lower()
+      if mode == "active":
+          self.paused = False
+      else:
+          self.config.bot.mode = "passive"
+          self.paused = True
+      super().start()
+  ```
+
+  <Warning>
+    Activating Tier 3 triggers an immediate capital rebalance from Scenario B to Scenario A. Scalper T1 drops from 50% → 45% and Momentum T2 drops from 40% → 35%. Monitor both agents after activation.
+  </Warning>
+</Accordion>
+
+## BaseAgent Interface
+
+Every sub-agent extends `BaseAgent` (defined in `agents/base_agent.py`). The abstract base class provides the complete lifecycle and reporting interface. Sub-agents only need to implement `_build_strategy()`.
+
+<CardGroup cols={2}>
+  <Card title="start()" icon="play">
+    Runs one immediate cycle synchronously, then registers a 1-minute interval job on the APScheduler and starts the scheduler. Sets `paused = False` if `bot.mode == "active"`.
+  </Card>
+  <Card title="stop()" icon="stop">
+    Calls `scheduler.shutdown(wait=False)` and sets `paused = True`. The agent thread exits cleanly after the current cycle completes.
+  </Card>
+  <Card title="pause()" icon="pause">
+    Sets `paused = True` and `config.bot.mode = "passive"`. The scheduler keeps running but `run_cycle()` returns immediately without evaluating symbols.
+  </Card>
+  <Card title="resume()" icon="rotate-right">
+    Sets `paused = False` and `config.bot.mode = "active"`. The next scheduled cycle will execute normally. `SpeculativeAgent` overrides this to also send a Telegram notification.
+  </Card>
+  <Card title="get_status()" icon="circle-info">
+    Returns a dict with mode, pairs, timeframe, assigned capital, open positions, realized/unrealized PnL, win/loss counts, and a per-coin breakdown. Used by the Telegram `/status` command.
+  </Card>
+  <Card title="set_capital(amount)" icon="coins">
+    Stores the USDT amount assigned by the orchestrator. If `_assigned_capital == 0`, the agent falls back to reading from the `DigitalWallet` database table proportionally.
+  </Card>
+</CardGroup>
+
+```python
+# agents/base_agent.py — set_capital
+def set_capital(self, amount: float):
+    """Asigna el capital en USDT que puede usar este subagente."""
+    self._assigned_capital = amount
+    log.info(
+        f"[{self.agent_name}] Capital asignado: ${amount:,.2f} USDT "
+        f"({self.capital_pool_pct*100:.0f}% del total)"
+    )
+```
+
+## Per-Agent Telegram Control
+
+The orchestrator exposes granular control commands for each agent. Pausing `speculative_t3` immediately triggers a capital redistribution back to Scenario B; resuming it redistributes to Scenario A.
+
+```python
+# tradingbot/core/orchestrator.py
+async def pause_agent(self, agent_id: str) -> dict:
+    self.agents[agent_id].pause()
+    if agent_id == "speculative_t3":
+        total = await self._fetch_total_capital()
+        self._assign_capital(total, scenario_a=False)
+    return self.agents[agent_id].get_status()
+
+async def resume_agent(self, agent_id: str) -> dict:
+    self.agents[agent_id].resume()
+    if agent_id == "speculative_t3":
+        total = await self._fetch_total_capital()
+        self._assign_capital(total, scenario_a=True)
+    return self.agents[agent_id].get_status()
+```
+
+| Telegram Command | Effect |
+|---|---|
+| `/pause` | Pauses all agents globally via `orchestrator.paused = True` |
+| `/resume` | Resumes all agents (except Tier 3 if unactivated) |
+| `/pause_speculative` | Pauses Tier 3 + redistributes to Scenario B |
+| `/resume_speculative` | Activates Tier 3 + redistributes to Scenario A |
+| `/status` | Returns `format_global_status_message()` with PnL for all agents |

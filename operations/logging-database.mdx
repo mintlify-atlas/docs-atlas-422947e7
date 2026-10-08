@@ -1,0 +1,397 @@
+---
+title: "Logging, Database Models, and Observability"
+sidebarTitle: "Logging & Database"
+description: "Complete reference for the CSV-based logging system, SQLite schema, all six ORM models, and the APScheduler weekly report built into Trading Agent Bot."
+---
+
+Trading Agent Bot records every significant event to a set of structured CSV log files and persists all trading activity, portfolio state, and market data to a local SQLite database. Understanding the logging output and the database schema is essential for auditing trades, debugging strategy behaviour, and managing the accumulated ML training dataset.
+
+## Logging System
+
+The logger lives in `tradingbot/utils/logger.py`. Unlike a typical loguru or Python `logging` setup, the bot uses a **CSV-based audit log** written to three separate files under `~/.log/Tredding Agent/` (configurable via `BASE_LOG_DIR` in `.env`).
+
+### Log Files
+
+| File | Purpose |
+|---|---|
+| `log_general.csv` | Every event from every category — the full audit trail |
+| `log_errores.csv` | Only `ERROR`-level entries |
+| `log_reportes.csv` | Only `REPORTE`-level entries (financial summaries) |
+
+Each CSV row has three columns: `Timestamp`, `Tipo_Registro`, `Descripcion`.
+
+### The `registrar_log()` Function
+
+All logging goes through a single function that sanitises sensitive data, appends to the appropriate CSV files, and echoes to stdout (visible when running `CON TERMINAL`):
+
+```python
+def registrar_log(tipo_registro: str, descripcion: str):
+    """
+    Registra un evento en los logs CSV de forma sanitizada.
+    También imprime en consola para facilitar el debugging cuando
+    se corre 'CON TERMINAL'.
+    """
+    safe_desc = sanitize_sensitive_data(descripcion)
+    timestamp = now_chile().strftime("%Y-%m-%d %H:%M:%S")
+    row = [timestamp, tipo_registro.upper(), safe_desc]
+
+    print(f"[{timestamp}] [{tipo_registro.upper()}] {safe_desc}")
+
+    # Always write to general log
+    with open(LOG_GENERAL_PATH, mode='a', newline='', encoding='utf-8') as f:
+        csv.writer(f).writerow(row)
+
+    # Write to category-specific log
+    if tipo_registro.upper() == "ERROR":
+        with open(LOG_ERRORES_PATH, mode='a', newline='', encoding='utf-8') as f:
+            csv.writer(f).writerow(row)
+    elif tipo_registro.upper() == "REPORTE":
+        with open(LOG_REPORTES_PATH, mode='a', newline='', encoding='utf-8') as f:
+            csv.writer(f).writerow(row)
+```
+
+### Log Categories
+
+<CardGroup cols={3}>
+  <Card title="INFO" icon="circle-info">
+    General operational events: cycle start, signal generated, order placed.
+  </Card>
+  <Card title="ERROR" icon="circle-xmark">
+    Exceptions, connectivity failures, and unexpected states. Written to both `log_general.csv` and `log_errores.csv`.
+  </Card>
+  <Card title="REPORTE" icon="chart-bar">
+    Financial summaries, P&L reports, and weekly account snapshots. Written to both `log_general.csv` and `log_reportes.csv`.
+  </Card>
+  <Card title="WARNING" icon="triangle-exclamation">
+    Recoverable issues: insufficient data for EMA calculation, transient network timeout, risk limit approached.
+  </Card>
+  <Card title="CASHFLOW" icon="money-bill">
+    Capital movements: monetisation of assets, deposits, expenses. Used by `scripts/monetize_asset.py` and Telegram cashflow commands.
+  </Card>
+  <Card title="DEBUG" icon="bug">
+    Verbose development events. Not written by default — call `registrar_log("DEBUG", ...)` explicitly when troubleshooting.
+  </Card>
+</CardGroup>
+
+### Sensitive Data Sanitisation
+
+Before any string is written to disk, `sanitize_sensitive_data()` applies a chain of regex substitutions to redact secrets:
+
+```python
+_TELEGRAM_TOKEN_REGEX    = re.compile(r'\b\d{6,13}:[A-Za-z0-9_-]{30,50}\b')
+_TELEGRAM_BOT_URL_REGEX  = re.compile(r'bot(\d{6,13}:[A-Za-z0-9_-]{30,50})')
+_GITHUB_TOKEN_REGEX      = re.compile(r'ghp_[A-Za-z0-9]{36}')
+_GENERIC_BEARER_REGEX    = re.compile(r'(Bearer\s+)[A-Za-z0-9\-._~+/]+=*', re.IGNORECASE)
+```
+
+In addition to regex patterns, the sanitiser replaces any exact match of the values loaded from settings (`TELEGRAM_BOT_TOKEN`, `EXCHANGE_API_KEY`, `EXCHANGE_API_SECRET`) with `***REDACTED***`.
+
+### Logging Configuration (config.yaml)
+
+Log rotation and retention are defined in `config.yaml`:
+
+```yaml
+logging:
+  level: "INFO"         # Minimum level to record
+  rotation: "1 day"     # Rotate log files daily
+  retention: "30 days"  # Delete files older than 30 days
+  format: "json"        # Structured format (JSON) for ELK / Grafana export
+```
+
+### Compatibility Shim (`log` Object)
+
+Parts of the codebase use the `log.info()` / `log.error()` interface inherited from early loguru usage. A `LegacyLogger` shim maps those calls to `registrar_log()`:
+
+```python
+class LegacyLogger:
+    def debug(self, msg):   registrar_log("DEBUG",   msg)
+    def info(self, msg):    registrar_log("INFO",    msg)
+    def warning(self, msg): registrar_log("WARNING", msg)
+    def error(self, msg):   registrar_log("ERROR",   msg)
+
+log = LegacyLogger()
+```
+
+Import and use throughout the project:
+
+```python
+from tradingbot.utils.logger import log, registrar_log
+
+log.info("Bot cycle started")
+registrar_log("REPORTE", f"Weekly PnL: +${pnl:.2f} USD")
+registrar_log("CASHFLOW", f"MONETIZACION_SOL: +$38.00 USD realizado. Saldo: $88.00 USDT")
+```
+
+---
+
+## Database
+
+The bot uses **SQLite** via **SQLAlchemy 2.x** with async session support (`sqlalchemy.ext.asyncio`). The database file path is set in `.env`:
+
+```ini
+DATABASE_URL=sqlite:///tradingbot.db
+```
+
+The database is created automatically on first run via `Base.metadata.create_all()`. The `DatabaseSession` class in `tradingbot/execution/portfolio_manager.py` manages both sync and async engine instances and exposes `get_async_session()` as an async context manager.
+
+<Note>
+  Both `scripts/reset_to_16usd_matrix.py` and `scripts/reset_to_50usd.py` flush WAL before creating backups and preserve the `candles` and `decision_logs` tables intact — these contain the ML training dataset and must never be truncated during a capital reset.
+</Note>
+
+### Backup Files
+
+Each reset script creates a timestamped backup of the database file before making any changes:
+
+```
+tradingbot.db.bak_matrix_16usd_20250101_120000
+tradingbot.db.bak_pre_reset_50usd_20250101_130000
+```
+
+Keep these `.bak` files until you have confirmed the reset produced the expected state. They can be restored by renaming back to `tradingbot.db`.
+
+---
+
+## Database Models
+
+All models are defined in `tradingbot/database/models.py` and inherit from the shared `Base = declarative_base()`.
+
+<Accordion title="Trade — Individual order records">
+  The `trades` table is the primary ledger. Every BUY and SELL executed (or simulated in paper mode) produces one row.
+
+  ```python
+  class Trade(Base):
+      __tablename__ = 'trades'
+
+      id           = Column(Integer, primary_key=True)
+      trade_id     = Column(String, unique=True, index=True)
+      symbol       = Column(String, nullable=False)
+      side         = Column(String, nullable=False)        # BUY / SELL
+      order_type   = Column(String, default="MARKET")
+      quantity     = Column(Numeric(18, 8), nullable=False)
+      price_entry  = Column(Numeric(18, 8), nullable=False)
+      price_exit   = Column(Numeric(18, 8), nullable=True)
+      stop_loss    = Column(Numeric(18, 8), nullable=True)
+      take_profit  = Column(Numeric(18, 8), nullable=True)
+      pnl          = Column(Numeric(18, 8), nullable=True)
+      pnl_pct      = Column(Numeric(18, 8), nullable=True)
+      status       = Column(String, default="OPEN")        # OPEN, CLOSED, CANCELED
+      mode         = Column(String)
+      strategy     = Column(String)
+      opened_at    = Column(DateTime, default=datetime.utcnow)
+      closed_at    = Column(DateTime, nullable=True)
+      exchange     = Column(String)
+      is_paper     = Column(Boolean, default=True)
+      agent_id     = Column(String, default="legacy", nullable=True)
+      dca_step     = Column(Integer, default=1, nullable=True)
+      exit_reason  = Column(String, nullable=True)
+  ```
+
+  <ResponseField name="trade_id" type="string" required>
+    Unique identifier for the trade, typically formatted as `{symbol}_{timestamp}` or assigned by the exchange. Indexed for fast lookups.
+  </ResponseField>
+  <ResponseField name="symbol" type="string" required>
+    Trading pair in `BASE/QUOTE` format, e.g. `BTC/USDT`, `SOL/USDT`.
+  </ResponseField>
+  <ResponseField name="side" type="string" required>
+    Direction of the trade. One of `BUY` or `SELL`.
+  </ResponseField>
+  <ResponseField name="order_type" type="string">
+    Order execution type. Defaults to `MARKET`. May be `LIMIT` for future order types.
+  </ResponseField>
+  <ResponseField name="quantity" type="decimal(18,8)" required>
+    Number of base-currency units traded, stored with 8 decimal places.
+  </ResponseField>
+  <ResponseField name="price_entry" type="decimal(18,8)" required>
+    Execution price at which the position was opened.
+  </ResponseField>
+  <ResponseField name="price_exit" type="decimal(18,8)">
+    Execution price at which the position was closed. `NULL` while status is `OPEN`.
+  </ResponseField>
+  <ResponseField name="stop_loss" type="decimal(18,8)">
+    Stop-loss price calculated by the `RiskManager` at entry time.
+  </ResponseField>
+  <ResponseField name="take_profit" type="decimal(18,8)">
+    Take-profit target price. Used by static TP and overridden by trailing stop when active.
+  </ResponseField>
+  <ResponseField name="pnl" type="decimal(18,8)">
+    Realised profit or loss in USD. Populated on close.
+  </ResponseField>
+  <ResponseField name="pnl_pct" type="decimal(18,8)">
+    Realised profit or loss as a percentage of entry capital.
+  </ResponseField>
+  <ResponseField name="status" type="string">
+    Lifecycle state: `OPEN` (active position), `CLOSED` (exited normally), `CANCELED` (order not filled), `ARCHIVED` (reset by capital scripts).
+  </ResponseField>
+  <ResponseField name="is_paper" type="boolean">
+    `true` when the trade was executed in paper-trading mode. `false` for live exchange trades.
+  </ResponseField>
+  <ResponseField name="agent_id" type="string">
+    Identifies which agent executed the trade, e.g. `scalper_tier1`, `momentum_tier2`, `macro_btceth`. Defaults to `legacy` for pre-multi-agent trades.
+  </ResponseField>
+  <ResponseField name="dca_step" type="integer">
+    Dollar-Cost Averaging tranche number. `1` = initial entry, `2` = pullback top-up (micro-DCA second tranche).
+  </ResponseField>
+  <ResponseField name="exit_reason" type="string">
+    Human-readable reason for position closure: `TAKE_PROFIT`, `STOP_LOSS`, `TRAILING_STOP`, `TIME_STOP`, `MANUAL`, `SIGNAL_SELL`.
+  </ResponseField>
+</Accordion>
+
+<Accordion title="Portfolio — Per-asset holdings snapshot">
+  The `portfolio` table tracks the current quantity and average cost basis for each asset held. Updated after every fill and position close.
+
+  ```python
+  class Portfolio(Base):
+      __tablename__ = 'portfolio'
+
+      id              = Column(Integer, primary_key=True)
+      wallet_id       = Column(Integer, ForeignKey('digital_wallet.id'), nullable=True)
+      asset           = Column(String, index=True)
+      quantity        = Column(Numeric(18, 8), default=0.0)
+      avg_price       = Column(Numeric(18, 8), default=0.0)
+      current_price   = Column(Numeric(18, 8), default=0.0)
+      unrealized_pnl  = Column(Numeric(18, 8), default=0.0)
+      updated_at      = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+      is_paper        = Column(Boolean, default=True)
+      agent_id        = Column(String, default="legacy", nullable=True)
+
+      __table_args__ = (UniqueConstraint('asset', 'is_paper', name='_asset_paper_uc'),)
+  ```
+
+  The unique constraint on `(asset, is_paper)` ensures that each asset has exactly one paper and one live row, preventing duplicate portfolio entries.
+</Accordion>
+
+<Accordion title="DigitalWallet — Account balance ledger">
+  The `digital_wallet` table holds the liquid USDT balance available for new orders. The bot reads and updates this table on every trade fill to maintain precise accounting without querying the exchange.
+
+  ```python
+  class DigitalWallet(Base):
+      __tablename__ = 'digital_wallet'
+
+      id           = Column(Integer, primary_key=True)
+      telegram_id  = Column(String, index=True)
+      balance_usd  = Column(Numeric(18, 8), default=50.0)
+      is_paper     = Column(Boolean, default=True)
+
+      __table_args__ = (UniqueConstraint('telegram_id', 'is_paper', name='_telegram_paper_uc'),)
+  ```
+
+  The default `balance_usd` is `50.0` USD. Use `reset_to_16usd_matrix.py` or `reset_to_50usd.py` to reset to a known starting balance. The `/deposit` and `/expense` Telegram commands also modify this table directly.
+</Accordion>
+
+<Accordion title="Candle — Historical OHLCV for ML training">
+  The `candles` table stores every OHLCV bar fetched during the bot's trading cycles. It is the primary dataset for backtesting and future LSTM model training.
+
+  ```python
+  class Candle(Base):
+      """
+      Tabla de datos históricos para futuro entrenamiento de Machine Learning.
+      Almacena el histórico silenciosamente en cada ciclo.
+      """
+      __tablename__ = 'candles'
+
+      id        = Column(Integer, primary_key=True)
+      symbol    = Column(String, nullable=False, index=True)
+      timeframe = Column(String, nullable=False)
+      timestamp = Column(DateTime, nullable=False, index=True)
+      open      = Column(Numeric(18, 8), nullable=False)
+      high      = Column(Numeric(18, 8), nullable=False)
+      low       = Column(Numeric(18, 8), nullable=False)
+      close     = Column(Numeric(18, 8), nullable=False)
+      volume    = Column(Numeric(18, 8), nullable=False)
+
+      __table_args__ = (
+          UniqueConstraint('symbol', 'timeframe', 'timestamp', name='_symbol_tf_ts_uc'),
+      )
+  ```
+
+  Inserts are append-only and idempotent: the `DataCollector` queries the latest stored timestamp per `(symbol, timeframe)` pair and only inserts newer rows. The unique constraint on `(symbol, timeframe, timestamp)` provides a secondary safety net against duplicates.
+</Accordion>
+
+<Accordion title="DecisionLog — Per-cycle micro-decision audit">
+  Every signal evaluation in every `run_cycle` produces a `DecisionLog` row. This table enables statistical analysis of how often the strategy fires BUY vs SELL vs HOLD and which conditions block orders.
+
+  ```python
+  class DecisionLog(Base):
+      """
+      Registra las micro-decisiones del bot para análisis estadístico.
+      """
+      __tablename__ = 'decision_logs'
+
+      id        = Column(Integer, primary_key=True)
+      timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+      symbol    = Column(String, nullable=False, index=True)
+      decision  = Column(String, nullable=False)   # HOLD, BUY, SELL, BLOCKED
+      reason    = Column(String, nullable=True)
+  ```
+
+  <ResponseField name="timestamp" type="datetime" required>
+    UTC datetime of the cycle in which the decision was evaluated. Indexed for time-range queries.
+  </ResponseField>
+  <ResponseField name="symbol" type="string" required>
+    Trading pair that was evaluated, e.g. `SOL/USDT`. Indexed for per-symbol analytics.
+  </ResponseField>
+  <ResponseField name="decision" type="string" required>
+    The outcome of the strategy evaluation for this cycle. One of:
+    - `BUY` — EMA crossover generated a buy signal and risk checks passed
+    - `SELL` — EMA crossover generated a sell signal
+    - `HOLD` — No crossover detected
+    - `BLOCKED` — Signal was generated but blocked by risk manager (e.g. max positions reached, daily loss limit hit)
+  </ResponseField>
+  <ResponseField name="reason" type="string">
+    Free-text explanation for the decision, e.g. `"EMA fast crossed above slow"`, `"Max open positions reached (10/10)"`, `"Waiting for 5m candle to close"`.
+  </ResponseField>
+</Accordion>
+
+<Accordion title="CashFlow — Financial transaction ledger">
+  The `cash_flow` table records every capital movement: Telegram `/deposit` and `/expense` commands, profit harvesting events, and asset monetisation. Used to generate the `/cashflow` report in Telegram.
+
+  ```python
+  class CashFlow(Base):
+      __tablename__ = 'cash_flow'
+
+      id          = Column(Integer, primary_key=True)
+      telegram_id = Column(String, index=True)
+      timestamp   = Column(DateTime, default=datetime.utcnow, index=True)
+      type        = Column(String, nullable=False)      # DEPOSIT, EXPENSE, WITHDRAWAL
+      amount_usd  = Column(Numeric(18, 8), nullable=False)
+      description = Column(String, nullable=True)
+      is_paper    = Column(Boolean, default=True)
+  ```
+
+  Transaction types:
+  - **`DEPOSIT`** — Capital added to the paper wallet via `/deposit` command
+  - **`EXPENSE`** — Capital removed or costs recorded via `/expense` command
+  - **`WITHDRAWAL`** — Profit taken out; recorded by `monetize_asset.py` and profit harvest service
+</Accordion>
+
+---
+
+## Weekly Report Scheduler
+
+The bot uses **APScheduler** (`apscheduler==3.11.3`) to dispatch a weekly financial summary to Telegram. The schedule is defined in `config.yaml`:
+
+```yaml
+scheduler:
+  weekly_report:
+    day: "monday"              # Day of week for the report
+    hour: 8                    # 08:00 local time
+    minute: 0
+    timezone: "America/Santiago"
+```
+
+The `TradingBot` class initialises a `BackgroundScheduler` and registers the weekly report job on startup:
+
+```python
+from apscheduler.schedulers.background import BackgroundScheduler
+
+self.scheduler = BackgroundScheduler()
+# Weekly report job is registered with cron trigger:
+# day_of_week="monday", hour=8, minute=0, timezone="America/Santiago"
+```
+
+The weekly report queries the `trades`, `cash_flow`, and `digital_wallet` tables and sends a Telegram message with:
+- Total P&L for the week (USD and CLP via the `CLPConverter`)
+- Number of trades opened and closed
+- Win rate percentage
+- Current wallet balance
+- Largest single-trade gain and loss
