@@ -1,7 +1,7 @@
 ---
-title: "Logging, Database Models, and Observability"
+title: "Logging, Database Models, and Observability Reference"
 sidebarTitle: "Logging & Database"
-description: "Complete reference for the CSV-based logging system, SQLite schema, all six ORM models, and the APScheduler weekly report built into Trading Agent Bot."
+description: "Complete reference for the CSV-based logging system, SQLite schema, all six database ORM models, and the APScheduler job config in Trading Agent Bot."
 ---
 
 Trading Agent Bot records every significant event to a set of structured CSV log files and persists all trading activity, portfolio state, and market data to a local SQLite database. Understanding the logging output and the database schema is essential for auditing trades, debugging strategy behaviour, and managing the accumulated ML training dataset.
@@ -32,7 +32,11 @@ def registrar_log(tipo_registro: str, descripcion: str):
     se corre 'CON TERMINAL'.
     """
     safe_desc = sanitize_sensitive_data(descripcion)
-    timestamp = now_chile().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        from tradingbot.utils.tz import now_chile
+        timestamp = now_chile().strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     row = [timestamp, tipo_registro.upper(), safe_desc]
 
     print(f"[{timestamp}] [{tipo_registro.upper()}] {safe_desc}")
@@ -88,15 +92,19 @@ In addition to regex patterns, the sanitiser replaces any exact match of the val
 
 ### Logging Configuration (config.yaml)
 
-Log rotation and retention are defined in `config.yaml`:
+The `logging` block in `config.yaml` defines the desired log level and metadata for future integrations:
 
 ```yaml
 logging:
   level: "INFO"         # Minimum level to record
-  rotation: "1 day"     # Rotate log files daily
-  retention: "30 days"  # Delete files older than 30 days
-  format: "json"        # Structured format (JSON) for ELK / Grafana export
+  rotation: "1 day"     # Intended rotation policy (future use)
+  retention: "30 days"  # Intended retention policy (future use)
+  format: "json"        # Intended output format (future use)
 ```
+
+<Note>
+  The current CSV-based logger (`tradingbot/utils/logger.py`) reads `level` for reference but does not implement file rotation or retention automatically — the `rotation`, `retention`, and `format` keys are reserved for a future structured-logging upgrade. Manage disk usage by periodically archiving or deleting old CSV files under `~/.log/Tredding Agent/`.
+</Note>
 
 ### Compatibility Shim (`log` Object)
 
@@ -366,32 +374,35 @@ All models are defined in `tradingbot/database/models.py` and inherit from the s
 
 ---
 
-## Weekly Report Scheduler
+## APScheduler — Background Job Scheduler
 
-The bot uses **APScheduler** (`apscheduler==3.11.3`) to dispatch a weekly financial summary to Telegram. The schedule is defined in `config.yaml`:
+The bot uses **APScheduler** (`apscheduler==3.11.3`) via `BackgroundScheduler` to drive its trading cycles. The `config.yaml` `scheduler` block defines the desired weekly report schedule, but that cron job has not yet been wired into `TradingBot`:
 
 ```yaml
 scheduler:
   weekly_report:
-    day: "monday"              # Day of week for the report
+    day: "monday"              # Target day for the weekly summary
     hour: 8                    # 08:00 local time
     minute: 0
     timezone: "America/Santiago"
 ```
 
-The `TradingBot` class initialises a `BackgroundScheduler` and registers the weekly report job on startup:
+The `TradingBot.start()` method currently registers two interval jobs:
 
 ```python
 from apscheduler.schedulers.background import BackgroundScheduler
 
 self.scheduler = BackgroundScheduler()
-# Weekly report job is registered with cron trigger:
-# day_of_week="monday", hour=8, minute=0, timezone="America/Santiago"
+
+# Main trading cycle — evaluates all configured pairs every minute
+self.scheduler.add_job(self._run_cycle_sync, 'interval', minutes=1)
+
+# Dashboard command processor — polls BotCommand table every 5 seconds
+self.scheduler.add_job(self._process_dashboard_commands, 'interval', seconds=5)
+
+self.scheduler.start()
 ```
 
-The weekly report queries the `trades`, `cash_flow`, and `digital_wallet` tables and sends a Telegram message with:
-- Total P&L for the week (USD and CLP via the `CLPConverter`)
-- Number of trades opened and closed
-- Win rate percentage
-- Current wallet balance
-- Largest single-trade gain and loss
+<Note>
+  The automated weekly Telegram report described in the `scheduler.weekly_report` config block is not yet implemented in `TradingBot`. The `tradingbot/utils/scheduler.py` file is a stub. Weekly summaries can be requested manually at any time via the `/report` Telegram command.
+</Note>

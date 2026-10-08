@@ -1,5 +1,5 @@
 ---
-title: "Deploy and Run Trading Agent Bot in Production"
+title: "Deploy and Run Trading Agent Bot in Production (tmux)"
 sidebarTitle: "Deployment"
 description: "Step-by-step guide to deploying Trading Agent Bot as a persistent background service with tmux, environment setup, and production-readiness hardening."
 ---
@@ -60,6 +60,8 @@ if [ "$CHOICE" = "1" ]; then
         alacritty -e bash -c "source .venv/bin/activate && python main.py; exec bash" &
     elif command -v kitty &> /dev/null; then
         kitty bash -c "source .venv/bin/activate && python main.py; exec bash" &
+    elif command -v foot &> /dev/null; then
+        foot bash -c "source .venv/bin/activate && python main.py; exec bash" &
     else
         x-terminal-emulator -e bash -c "source .venv/bin/activate && python main.py; exec bash" &
     fi

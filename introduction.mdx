@@ -1,7 +1,7 @@
 ---
 title: "Trading Agent Bot: Autonomous Crypto Trading via Telegram"
 sidebarTitle: "Introduction"
-description: "An asynchronous multi-agent Python trading bot connecting to Binance via CCXT, controlled entirely through Telegram with built-in risk management and paper trading."
+description: "A multi-agent Python trading bot connecting to Binance via CCXT, controlled through Telegram with built-in risk management and paper trading support."
 ---
 
 Trading Agent Bot is an open-source, asynchronous cryptocurrency trading system that coordinates four independent sub-agents — each running its own strategy and capital pool — under a single orchestrator. The bot connects to Binance (or Binance Testnet) through the CCXT library, evaluates EMA crossover signals on a per-cycle basis, and executes or simulates trades automatically. Every aspect of operation — starting and stopping agents, switching trading modes, reviewing portfolio performance, depositing virtual capital, and receiving scheduled reports — is accessible through a private Telegram chat, making the bot fully operable from a mobile device with no terminal access required.
@@ -63,5 +63,5 @@ The `trading_mode` setting (configurable in `config.yaml` or live via `/mode` in
 Trading Agent Bot is aimed at Python developers and quantitative trading enthusiasts who want a production-grade, self-hosted bot they can understand, extend, and run without paying for cloud signal services. It is equally useful as a paper-trading learning environment for those studying algorithmic trading mechanics before committing real capital.
 
 <Note>
-  The project requires Python 3.10 or later. All async I/O is built on `asyncio` with `uvloop` for performance; scheduling runs through `APScheduler`; Telegram integration uses `python-telegram-bot` v22.
+  The project requires Python 3.10 or later. Async I/O runs on `asyncio`; background scheduling uses `APScheduler`; Telegram integration uses `python-telegram-bot` v22. Structured logs are written to CSV files (`log_general.csv`, `log_errores.csv`, `log_reportes.csv`) in the directory set by `BASE_LOG_DIR`.
 </Note>

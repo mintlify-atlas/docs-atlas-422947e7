@@ -1,7 +1,7 @@
 ---
 title: "The Trading Cycle: How Each Agent Evaluates the Market"
 sidebarTitle: "Trading Cycle"
-description: "A step-by-step breakdown of the 60-second run_cycle loop: anti-repainting guard, dynamic timeframe, concurrent symbol evaluation, EMA signal, risk gates, and order execution."
+description: "Per-agent market evaluation every 60 seconds: candle guard, timeframe selection, EMA signal, risk gates, Micro DCA entry, and DecisionLog writes to SQLite."
 ---
 
 Every 60 seconds, APScheduler fires a synchronous wrapper that hands control to an async `run_cycle()` coroutine. This coroutine performs a single pass over all symbols assigned to the agent — every symbol is evaluated concurrently via `asyncio.gather()`, with each evaluation running the full decision pipeline: anti-repainting guard, OHLCV fetch, EMA signal generation, open-trade exit management, BTC macro bias check, risk validation, Micro DCA order sizing, and finally a bulk `DecisionLog` write to SQLite. Understanding this pipeline is essential for tuning take-profit targets, adjusting timeframes, or adding new risk filters.
@@ -233,7 +233,7 @@ The agent's `trading_mode` field (from the YAML `bot.trading_mode`) is distinct 
 
 When `micro_dca.enabled: true`, a BUY signal does not immediately commit the full coin budget. Instead it is split into two tranches:
 
-```
+```text
 Tranche 1 (initial):  ~53.33% of coin budget  → executed on BUY signal
 Tranche 2 (pullback): ~46.67% of coin budget  → executed if price retraces -0.6% to -2.5%
 ```

@@ -8,7 +8,7 @@ Trading Agent Bot is configured through two separate files that serve distinct p
 
 ## Environment Variables (`.env`)
 
-Copy `.env.example` to `.env` at the project root and populate each variable with your real values before launching. The file is parsed by `pydantic-settings` via the `EnvSettings` class in `tradingbot/core/config.py`, which validates types and applies defaults where shown.
+Copy `.env.example` to `.env` at the project root and populate each variable with your real values before launching. The exchange, Telegram, database, and general settings are validated by `pydantic-settings` via the `EnvSettings` class in `tradingbot/core/config.py`. The optional email (SMTP) variables and `LOG_LEVEL` are read directly from the environment via `os.getenv()` in the modules that use them and are not validated by `EnvSettings`.
 
 ### Exchange
 
@@ -88,7 +88,7 @@ Copy `.env.example` to `.env` at the project root and populate each variable wit
 
 ## `config.yaml`
 
-The YAML configuration file is loaded at startup by `load_yaml_config()` in `tradingbot/core/config.py` and validated against the `AppConfig` Pydantic model. The file is organised into five top-level sections: `bot`, `risk`, `strategies`, `scheduler`, and `logging`.
+The YAML configuration file is loaded at startup by `load_yaml_config()` in `tradingbot/core/config.py`. The `bot` and `risk` sections are validated against the `AppConfig` Pydantic model. The `strategies`, `scheduler`, and `logging` sections are present in the file for forward compatibility and are read by their respective modules directly from the parsed YAML dictionary.
 
 <Tip>
   Each of the four sub-agents (Scalper, Momentum, Macro, Speculative) can override any of these settings through their own YAML files in the `configs/` directory: `configs/agent_scalper.yaml`, `configs/agent_momentum.yaml`, `configs/agent_macro.yaml`, and `configs/agent_speculative.yaml`. Agent-level configs are merged on top of the global `config.yaml` at agent initialisation time, allowing per-agent capital pools, timeframes, and risk parameters without duplicating the entire config.
@@ -354,20 +354,22 @@ Automatically liquidates extraordinary gains above a threshold back into the bas
 
 ### `logging` — Log Management
 
+The bot writes structured CSV logs to three files inside the directory configured by `BASE_LOG_DIR` (default `~/.log/Tredding Agent/`): `log_general.csv` (all events), `log_errores.csv` (errors only), and `log_reportes.csv` (scheduled report entries). The `logging` section in `config.yaml` documents the intended future log-management settings; the fields below are reserved for an upcoming loguru integration.
+
 <ParamField path="logging.level" type="string" default="INFO">
-  Minimum log severity level. Mirrors the `LOG_LEVEL` environment variable; the env var takes precedence if both are set.
+  Minimum log severity level. Currently informational; the active log filter is controlled by the `LOG_LEVEL` environment variable read by the modules that use it.
 </ParamField>
 
 <ParamField path="logging.rotation" type="string" default="1 day">
-  Loguru rotation schedule. Log files are rotated and compressed on this interval. Examples: `"500 MB"`, `"1 week"`, `"1 day"`.
+  Intended log-file rotation interval for a planned loguru integration. Not actively applied by the current CSV logger. Examples: `"500 MB"`, `"1 week"`, `"1 day"`.
 </ParamField>
 
 <ParamField path="logging.retention" type="string" default="30 days">
-  How long rotated log archives are kept before deletion. Prevents unbounded disk growth on long-running deployments.
+  Intended retention period for rotated log archives. Not actively applied by the current CSV logger.
 </ParamField>
 
 <ParamField path="logging.format" type="string" default="json">
-  Log output format. `json` produces structured records compatible with log aggregation platforms (ELK Stack, Grafana Loki, etc.).
+  Intended log output format for a planned loguru integration. Not actively applied by the current CSV logger.
 </ParamField>
 
 ---

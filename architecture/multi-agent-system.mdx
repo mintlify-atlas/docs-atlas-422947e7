@@ -1,7 +1,7 @@
 ---
 title: "Multi-Agent System: Four Parallel Trading Sub-Agents"
 sidebarTitle: "Multi-Agent System"
-description: "How OrchestratorBot initializes, funds, and controls four specialized sub-agents running in parallel threads with per-agent capital pools and independent schedulers."
+description: "How OrchestratorBot initializes, funds, and controls four specialized sub-agents running in parallel threads with independent capital pools and schedulers."
 ---
 
 Trading Agent Bot replaces a monolithic trading loop with a coordinated fleet of four specialized sub-agents. Each sub-agent owns its own APScheduler instance, its own YAML configuration, its own slice of the total capital, and its own trading strategy. The `OrchestratorBot` acts as the single process root: it fetches total portfolio equity on startup, distributes capital using a fixed matrix, launches each agent in a dedicated daemon thread, and exposes per-agent control commands through the Telegram interface. No sub-agent communicates directly with another — all coordination flows through the orchestrator.
@@ -242,7 +242,7 @@ def _assign_capital(self, total_capital: float, scenario_a: bool = None):
 </Accordion>
 
 <Accordion title="SpeculativeAgent — Tier 3 (0% capital by default, PASSIVE)">
-  `SpeculativeAgent` targets high-risk anomaly tokens (BEAMX, MUBARAK) susceptible to whale manipulation. It **always starts in PASSIVE mode** regardless of the YAML config, and receives zero capital in Scenario B. Human confirmation via `/resume_speculative` is required before it trades.
+  `SpeculativeAgent` targets high-risk anomaly tokens (BEAMX, MUBARAK) susceptible to whale manipulation. Its startup mode is controlled by the `bot.mode` field in its YAML config. With the default config (`mode: active`), it starts active; set `mode: passive` to hold it in monitoring-only state at boot. It receives zero capital in Scenario B. Human confirmation via `/resume_speculative` is required to fund and activate it.
 
   **Configuration file:** `configs/agent_speculative.yaml`
 
@@ -253,7 +253,7 @@ def _assign_capital(self, total_capital: float, scenario_a: bool = None):
     capital_pool_pct: 0.10           # 10% only in Scenario A
 
   bot:
-    mode: "active"                   # Overridden to PASSIVE by start() method
+    mode: "active"                   # start() respects this value — set to "passive" to hold at boot
     trading_mode: "scalper"
     timeframe: "15m"                 # Longer candles filter false spikes
     trading_pairs:
@@ -272,7 +272,7 @@ def _assign_capital(self, total_capital: float, scenario_a: bool = None):
       slow_period: 55                # Slower EMA filters speculative noise
   ```
 
-  The `SpeculativeAgent.start()` override always sets `paused = True` and `mode = "passive"` before delegating to `BaseAgent.start()`:
+  The `SpeculativeAgent.start()` override reads `bot.mode` from the YAML config and sets `paused` accordingly before delegating to `BaseAgent.start()`. With `mode: "active"` (the default), it starts active; with `mode: "passive"`, it enters monitoring-only state:
 
   ```python
   # agents/speculative_agent.py

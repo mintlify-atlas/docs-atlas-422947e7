@@ -1,7 +1,7 @@
 ---
 title: "Get Trading Agent Bot Running in Minutes with Paper Mode"
 sidebarTitle: "Quickstart"
-description: "Clone the repo, configure Telegram and Binance Testnet credentials, and launch the bot in safe paper-trading mode — no real funds required to get started."
+description: "Clone the repo, configure Telegram and Binance Testnet credentials, and launch the bot in safe paper-trading mode — no real funds required."
 ---
 
 This guide walks you through every step needed to get Trading Agent Bot running locally from scratch. By the end you will have a live bot connected to Binance Testnet, responding to Telegram commands, and simulating trades in paper mode — all without touching real money. The entire process takes under ten minutes on any machine running Python 3.10+.
@@ -44,7 +44,7 @@ This guide walks you through every step needed to get Trading Agent Bot running 
     | `pandas==3.0.6` | Candle data processing for EMA calculations |
     | `pydantic-settings==2.15.0` | Environment variable validation |
     | `uvloop==0.22.1` | High-performance async event loop |
-    | `loguru==0.7.3` | Structured logging to CSV and console |
+    | `loguru==0.7.3` | Logging library dependency (structured log output) |
   </Step>
 
   <Step title="Create your .env file">
@@ -147,19 +147,19 @@ This guide walks you through every step needed to get Trading Agent Bot running 
 
     The entry point initialises the `OrchestratorBot`, starts all sub-agent scheduler threads in the background, and then hands control to `TelegramListener` which blocks the main thread and begins polling Telegram for commands.
 
-    ```
-    INFO  | Initializing Multi-Agent TradingBot Application...
-    INFO  | OrchestratorBot started. Sub-agent schedulers running.
-    INFO  | TelegramListener polling for updates...
+    ```text
+    [INFO] Initializing Multi-Agent TradingBot Application...
+    [INFO] [Orchestrator] === INICIANDO SISTEMA MULTI-AGENTE ===
+    [INFO] Iniciando modo interactivo (Polling) de Telegram con soporte HTML y Botones Inline...
     ```
 
-    You can also start the bot in a detached `tmux` session using the provided launcher script, which is useful on headless servers:
+    On Linux desktop systems, you can use the provided graphical launcher script:
 
     ```bash
     bash start_bot.sh
     ```
 
-    The launcher presents a menu asking whether to run the bot in a visible terminal or silently in the background via `tmux`. If the bot is already running in a `tmux` session named `tradingbot`, the script will detect this and offer to attach to that session instead of starting a second instance.
+    The launcher opens a `zenity` graphical dialog (requires a Linux desktop environment with `zenity` installed) asking whether to run the bot in a visible terminal window or silently in the background via `tmux`. If the bot is already running in a `tmux` session named `tradingbot`, the script detects this and notifies you rather than starting a second instance.
 
     <Tip>
       To run as a background service without a GUI desktop environment (e.g. on a VPS), start the bot directly with `tmux new-session -d -s tradingbot "source .venv/bin/activate && python main.py"` and detach with `Ctrl+B, D`. Reattach any time with `tmux attach -t tradingbot`.
@@ -169,7 +169,7 @@ This guide walks you through every step needed to get Trading Agent Bot running 
   <Step title="Send /start in Telegram">
     Open Telegram and start a conversation with the bot you created in Step 3. Send the following command:
 
-    ```
+    ```text
     /start
     ```
 
@@ -177,7 +177,7 @@ This guide walks you through every step needed to get Trading Agent Bot running 
 
     A few useful commands to verify everything is working:
 
-    ```
+    ```text
     /status       — Show current bot mode, open positions, and portfolio summary
     /cashflow     — Display income, expenses, and net P&L for the virtual wallet
     /deposit 100  — Add $100 USDT to the paper-trading virtual wallet

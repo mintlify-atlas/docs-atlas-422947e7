@@ -1,7 +1,7 @@
 ---
 title: "EMA Crossover Strategy: Signal Generation and Logic"
 sidebarTitle: "EMA Crossover"
-description: "Deep dive into the two EMA strategies powering Trading Agent Bot — how crossover signals are generated, validated against closed candles, and dispatched as BUY, SELL, or HOLD."
+description: "How Trading Agent Bot generates BUY, SELL, and HOLD signals using EMA 9/21 crossover for altcoins and EMA 50/200 Golden Cross for BTC and ETH."
 ---
 
 Trading Agent Bot ships two Exponential Moving Average strategies. The primary `EMACrossoverStrategy` (fast=9 / slow=21) drives most agents with high-frequency signals optimised for volatile altcoin markets. The `EMAMacroStrategy` (EMA 50/200) is reserved exclusively for the `MacroTraderAgent` (BTC/ETH), trading institutional Golden/Death Crosses on 15-minute candles with a volume filter and a noise-zone guard. Both strategies implement the same abstract `BaseStrategy` interface, so they are fully interchangeable through the `strategies.active` key in any agent config file.

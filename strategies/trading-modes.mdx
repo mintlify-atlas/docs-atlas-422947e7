@@ -1,7 +1,7 @@
 ---
 title: "Trading Modes: Trend, Target, and Scalper Explained"
 sidebarTitle: "Trading Modes"
-description: "Learn how each of the three trading modes changes exit logic, stop-loss behaviour, and trade frequency — and when to choose each one for your market conditions."
+description: "How the three trading modes — trend, target, and scalper — change exit logic, stop-loss behavior, and take-profit targets in Trading Agent Bot."
 ---
 
 Trading Agent Bot supports three distinct behavioral modes that change how the trade engine manages open positions. Switching modes does **not** change the entry signal — the EMA crossover still triggers BUY at the same moment regardless of mode. What changes is the **exit logic**: how aggressively losses are cut, whether profit targets are hard or flexible, and how quickly winning trades are closed. The active mode is stored in `config.yaml` under `bot.trading_mode` and can be changed at runtime without restarting the bot via a Telegram command or inline keyboard button.
@@ -188,21 +188,29 @@ Send the `/mode` command followed by the mode name, or tap the inline keyboard b
 /mode scalper
 ```
 
-The Telegram listener writes a `BotCommand` record to the database with `command=MODE` and `args=<mode>`. The bot's `_process_dashboard_commands()` method picks this up every 5 seconds and persists the change directly to `config.yaml`:
+The Telegram `mode_command()` handler validates the argument and immediately calls `_apply_mode_change()`, which updates the in-memory config and persists the change to `config.yaml` using a regex substitution — preserving all comments and formatting in the file:
 
 ```python
-elif c_name == 'MODE':
-    if c_args in ['trend', 'target', 'scalper']:
-        self.config.bot.trading_mode = c_args
-        # Persist to config.yaml immediately
-        import yaml
-        with open("config.yaml", "r") as f:
-            data = yaml.safe_load(f)
-        if "bot" in data:
-            data["bot"]["trading_mode"] = c_args
-        with open("config.yaml", "w") as f:
-            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
-        log.info(f"DASHBOARD CMD: Mode changed to {c_args}")
+# telegram_listener.py — mode_command() + _apply_mode_change()
+async def mode_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    new_mode = context.args[0].lower()
+    if new_mode not in ["trend", "target", "scalper"]:
+        await update.message.reply_text("❌ Modo inválido.")
+        return
+    self._apply_mode_change(new_mode)
+
+def _apply_mode_change(self, new_mode: str):
+    self.bot_instance.config.bot.trading_mode = new_mode
+    import re
+    with open("config.yaml", "r", encoding="utf-8") as f:
+        content = f.read()
+    new_content = re.sub(
+        r'(trading_mode:\s*)"?[a-zA-Z0-9_-]+"?',
+        rf'\g<1>"{new_mode}"',
+        content
+    )
+    with open("config.yaml", "w", encoding="utf-8") as f:
+        f.write(new_content)
 ```
 
 <Note>

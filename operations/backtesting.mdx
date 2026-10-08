@@ -72,28 +72,29 @@ class Candle(Base):
 
 ## Running a Backtest
 
-The `backtests/run_backtest.py` script is the entry point for offline simulation. It loads candles from `tradingbot.db`, wraps the EMA crossover logic inside a `backtesting.py` `Strategy` subclass, and runs the simulation over the selected symbol and date range.
+The `backtests/run_backtest.py` file is included in the repository as an entry-point stub for offline simulation against the accumulated `candles` table. The intended design loads candles from `tradingbot.db`, wraps the EMA crossover logic inside a `backtesting.py` `Strategy` subclass, and runs the simulation over the selected symbol and date range.
 
-### Prerequisites
+### Dependencies
 
-Install the `backtesting` library (already included in `requirements.txt`):
-
-```bash
-pip install backtesting==0.6.6
-```
-
-The following additional packages from `requirements.txt` are also used by the backtest runner:
+All required packages are already pinned in `requirements.txt`:
 
 ```
+backtesting==0.6.6
 pandas==3.0.6
 numpy==2.5.3
 bokeh==3.10.0       # interactive HTML report
 SQLAlchemy==2.1.1   # database access
 ```
 
-### Adapting the EMA Crossover Strategy for `backtesting.py`
+Install any missing packages:
 
-The live strategy class (`EMACrossoverStrategy`) uses a `generate_signal()` interface driven by raw DataFrames. For `backtesting.py`, the logic is wrapped inside a `Strategy` subclass that uses the library's indicator API:
+```bash
+pip install backtesting==0.6.6
+```
+
+### Implementing the Backtest Runner
+
+The `backtesting` library expects a `Strategy` subclass with `init()` and `next()` methods and a `pandas.DataFrame` with title-cased columns (`Open`, `High`, `Low`, `Close`, `Volume`). The recommended pattern is to query the `candles` table directly via `sqlite3`, rename columns, and pass the result to `Backtest`:
 
 ```python
 #!/usr/bin/env python3
@@ -134,10 +135,7 @@ def load_candles(db_path: str, symbol: str, timeframe: str) -> pd.DataFrame:
 
 
 class EMACrossover(Strategy):
-    """
-    EMA 9/21 crossover strategy for backtesting.py.
-    Mirrors the logic in tradingbot/strategies/ema_crossover.py.
-    """
+    """EMA 9/21 crossover strategy — mirrors EMACrossoverStrategy logic."""
     fast_period = 9    # configurable via bt.optimize()
     slow_period = 21
 
@@ -169,20 +167,16 @@ def main():
     parser.add_argument("--db",        default="tradingbot.db",  help="Path to SQLite database")
     args = parser.parse_args()
 
-    print(f"Loading candles: {args.symbol} @ {args.timeframe} from {args.db}")
     df = load_candles(args.db, args.symbol, args.timeframe)
-
     if df.empty:
         print("❌ No candle data found. Let the bot run for at least one cycle to accumulate data.")
         return
 
     print(f"✅ Loaded {len(df)} candles ({df.index[0]} → {df.index[-1]})")
-
     bt = Backtest(df, EMACrossover, cash=args.cash, commission=0.001)
     stats = bt.run()
     print(stats)
 
-    # Save interactive HTML report
     report_path = f"backtest_{args.symbol.replace('/', '')}_{args.timeframe}.html"
     bt.plot(filename=report_path, open_browser=False)
     print(f"📊 Report saved to {report_path}")

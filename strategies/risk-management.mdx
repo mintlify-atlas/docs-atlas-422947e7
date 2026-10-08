@@ -1,7 +1,7 @@
 ---
 title: "Risk Management: Guards, Limits, and Position Sizing"
 sidebarTitle: "Risk Management"
-description: "Complete reference for every risk control in Trading Agent Bot — from position limits and daily loss guards to trailing stops, Micro-DCA order splitting, and automatic profit harvesting."
+description: "All risk controls in Trading Agent Bot: position limits, daily loss guards, trailing stops, Micro-DCA order splitting, and automatic profit harvesting."
 ---
 
 Trading Agent Bot enforces risk at multiple independent layers. Before any BUY order is placed, the `RiskManager` verifies position count, capital exposure, and daily loss limits. While a position is open, the `TradeEngine` continuously monitors take-profit, stop-loss, trailing stop, hard emergency stop, and a time-based safety exit. Layered on top are two optional services — the `BTCMarketBiasFilter` that gates all altcoin entries on Bitcoin's macro trend, and the `ProfitHarvestEngine` that automatically liquidates extraordinary gains. All settings live under the `risk:` block in `config.yaml`.
